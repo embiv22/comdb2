@@ -2192,10 +2192,11 @@ uint32_t bdb_get_rep_gen(bdb_state_type *bdb_state)
     return mygen;
 }
 
-void send_newmaster(bdb_state_type *bdb_state)
+void send_newmaster(bdb_state_type *bdb_state, int online)
 {
     bdb_state->dbenv->rep_start(bdb_state->dbenv, NULL, 0, DB_REP_MASTER);
-    bdb_add_dummy_llmeta();
+    /* Online recovery can wait-for-seqnum */
+    bdb_add_dummy_llmeta_wait(online);
 }
 
 /* Called by the master to periodically broadcast the durable lsn.  The
@@ -4080,6 +4081,7 @@ static int process_berkdb(bdb_state_type *bdb_state, char *host, DBT *control,
 }
 
 int gbl_force_incoherent = 0;
+int gbl_ignore_coherency = 0;
 
 static int bdb_am_i_coherent_int(bdb_state_type *bdb_state)
 {
@@ -4087,6 +4089,7 @@ static int bdb_am_i_coherent_int(bdb_state_type *bdb_state)
     if (bdb_amimaster(bdb_state))
         return 1;
 
+    /* force_incoherent overrides ignore_coherency */
     if (gbl_force_incoherent) {
         static time_t lastpr = 0;
         time_t now = time(NULL);
@@ -4105,6 +4108,18 @@ static int bdb_am_i_coherent_int(bdb_state_type *bdb_state)
                                               bdb_state->repinfo->myhost))) {
             return 0;
         }
+    }
+
+    if (gbl_ignore_coherency) {
+        static time_t lastpr = 0;
+        time_t now = time(NULL);
+        if (now - lastpr) {
+            logmsg(LOGMSG_WARN,
+                   "%s ignoring coherency on 'ignore_coherency' = true\n",
+                   __func__);
+            lastpr = now;
+        }
+        return 1;
     }
 
     return (gettimeofday_ms() <= get_coherency_timestamp());
@@ -4402,7 +4417,6 @@ static void pg_compact_do_work(struct thdpool *pool, void *work, void *thddata)
 
     __dbenv_pgcompact(dbenv, fileid, &dbt, gbl_pg_compact_thresh,
                       gbl_pg_compact_target_ff);
-    free(arg);
 }
 
 /* thread pool work function */
@@ -4413,10 +4427,8 @@ static void pg_compact_do_work_pp(struct thdpool *pool, void *work,
     case THD_RUN:
         pg_compact_do_work(pool, work, thddata);
         break;
-    case THD_FREE:
-        free(work);
-        break;
     }
+    free(work);
 }
 
 /* enqueue a page compact work */
@@ -4808,11 +4820,8 @@ static void udppfault_do_work(struct thdpool *pool, void *work, void *thddata)
     pgno = req->pgno;
 
     if ((ret = __dbreg_id_to_db_prefault(bdb_state->dbenv, NULL, &file_dbp,
-                                         fileid, 1)) != 0) {
-        // fprintf(stderr, "udp prefault: __dbreg_id_to_db failed with ret:
-        // %d\n", ret);
-        goto out;
-    }
+                                         fileid, 1)) != 0)
+        return;
 
     mpf = file_dbp->mpf;
 
@@ -4821,10 +4830,6 @@ static void udppfault_do_work(struct thdpool *pool, void *work, void *thddata)
         sleep(gbl_prefault_latency);
 
     __dbreg_prefault_complete(bdb_state->dbenv, fileid);
-
-out:
-    free(req);
-    return;
 }
 
 void touch_page(DB_MPOOLFILE *mpf, db_pgno_t pgno)
@@ -4857,10 +4862,8 @@ static void touch_page_pp(struct thdpool *pool, void *work, void *thddata,
     case THD_RUN:
         touch_page(mpf, pgno);
         break;
-    case THD_FREE:
-        free(work);
-        break;
     }
+    free(work);
 }
 
 int enqueue_touch_page(DB_MPOOLFILE *mpf, db_pgno_t pgno)
@@ -4883,10 +4886,8 @@ static void udppfault_do_work_pp(struct thdpool *pool, void *work,
     case THD_RUN:
         udppfault_do_work(pool, work, thddata);
         break;
-    case THD_FREE:
-        free(req);
-        break;
     }
+    free(req);
 }
 
 int enque_udppfault_filepage(bdb_state_type *bdb_state, unsigned int fileid,

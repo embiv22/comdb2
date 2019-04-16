@@ -8,6 +8,9 @@ TEST_TIMEOUT=${TEST_TIMEOUT:-5m}
 if [[ "$(arch)" == "armv7l" ]] ; then
     t=${TEST_TIMEOUT%%m}
     TEST_TIMEOUT=$(($t * 3 + 2))m
+elif [[ "x${DEBUGGER}" == "xvalgrind" ]] ||  [[ "x${DEBUGGER}" == "xcallgrind" ]]; then
+    t=${TEST_TIMEOUT%%m}
+    TEST_TIMEOUT=$(($t * 10 + 2))m
 fi
 SETUP_TIMEOUT=${SETUP_TIMEOUT:-2m}
 
@@ -230,7 +233,7 @@ verify_db_at_finish() {
 
     tables=$(timeout 1m $CDB2SQL_EXE ${LCLOPTIONS} --tabs $LCLDBNM default 'select * from comdb2_tables')
     for t in $tables ; do 
-        timeout 1m $CDB2SQL_EXE ${LCLOPTIONS} --tabs $LCLDBNM default "exec procedure sys.cmd.verify('$t')" &> verify.out
+        timeout 3m $CDB2SQL_EXE ${LCLOPTIONS} --tabs $LCLDBNM default "exec procedure sys.cmd.verify('$t')" &> verify.out
         if ! grep "Verify succeeded." verify.out > /dev/null ; then
             echo "Table $t"
             return
@@ -243,9 +246,13 @@ verify_db_at_finish() {
 
 call_setup
 
-echo "!$TESTCASE: running with timeout ${TEST_TIMEOUT}"
+DATETIME=$(date +"%Y-%m-%d %H:%M:%S")
+echo "!$TESTCASE: started running with timeout ${TEST_TIMEOUT} at $DATETIME"
 
 timeout ${TEST_TIMEOUT} ./runit ${DBNAME} 2>&1  | gawk '{ print strftime("%H:%M:%S>"), $0; fflush(); }' &> ${TESTDIR}/logs/${DBNAME}.testcase
+
+DATETIME=$(date +"%Y-%m-%d %H:%M:%S")
+echo "!$TESTCASE: finished running with timeout ${TEST_TIMEOUT} at $DATETIME"
 
 # get the return code from the first phase of the pipe
 rc=${PIPESTATUS[0]}

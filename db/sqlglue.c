@@ -164,6 +164,11 @@ void free_cached_idx(uint8_t **cached_idx)
     }
 }
 
+static void sqlite3MakeSureDbHasErr(sqlite3 *db, int rc){
+    if ((db == NULL) || (db->errCode != SQLITE_OK)) return;
+    db->errCode = (rc != SQLITE_OK) ? rc : SQLITE_ERROR;
+}
+
 extern int sqldbgflag;
 extern int gbl_notimeouts;
 extern int gbl_move_deadlk_max_attempt;
@@ -560,7 +565,9 @@ static void handle_failed_recover_deadlock(struct sqlclntstate *clnt,
     switch (recover_deadlock_rcode) {
     case SQLITE_COMDB2SCHEMA:
         clnt->osql.xerr.errval = CDB2ERR_SCHEMA;
+        sqlite3_mutex_enter(sqlite3_db_mutex(vdbe->db));
         sqlite3VdbeError(vdbe, "Database schema was changed");
+        sqlite3_mutex_leave(sqlite3_db_mutex(vdbe->db));
         errstat_cat_str(&clnt->osql.xerr,
                         "Database schema was changed during request");
         logmsg(LOGMSG_DEBUG, "%s sending CDB2ERR_SCHEMA\n", __func__);
@@ -569,14 +576,18 @@ static void handle_failed_recover_deadlock(struct sqlclntstate *clnt,
         clnt->osql.xerr.errval = CDB2ERR_CHANGENODE;
         errstat_cat_str(&clnt->osql.xerr,
                         "Client api should retry request");
+        sqlite3_mutex_enter(sqlite3_db_mutex(vdbe->db));
         sqlite3VdbeError(vdbe, "New master under snapshot");
+        sqlite3_mutex_leave(sqlite3_db_mutex(vdbe->db));
         logmsg(LOGMSG_DEBUG, "%s sending CDB2ERR_CHANGENODE\n", __func__);
         break;
     default:
         clnt->osql.xerr.errval = CDB2ERR_DEADLOCK;
         errstat_cat_str(&clnt->osql.xerr,
                         "Failed to reaquire locks on deadlock");
+        sqlite3_mutex_enter(sqlite3_db_mutex(vdbe->db));
         sqlite3VdbeError(vdbe, "Failed to reaquire locks on deadlock");
+        sqlite3_mutex_leave(sqlite3_db_mutex(vdbe->db));
         logmsg(LOGMSG_DEBUG, "%s sending CDB2ERR_DEADLOCK on %d\n", __func__,
                recover_deadlock_rcode);
         break;
@@ -3088,6 +3099,10 @@ void xdump(void *b, int len)
 
 const char *sqlite3ErrStr(int);
 
+sqlite3_int64 sqlite3BtreeMaxRecordSize(BtCursor *pCur){
+    return 2147483647; /* see vdbeMemFromBtreeResize in vdbemem.c */
+}
+
 /*
  ** Return the currently defined page size
  */
@@ -3971,10 +3986,8 @@ int sqlite3BtreeDropTable(Btree *pBt, int iTable, int *piMoved)
                 pBt->btreeid, iTable, sqlite3ErrStr(rc));
 
     if (pBt->is_temporary) {
-#ifndef NDEBUG
-        struct sql_thread *thd = pthread_getspecific(query_info_key);
-#endif
-        assert( pBt->temp_table_mtx==thd->clnt->temp_table_mtx );
+        // TODO: The thread pool causes this to be violated.
+        // assert( pBt->temp_table_mtx==thd->clnt->temp_table_mtx );
         Pthread_mutex_lock(pBt->temp_table_mtx);
 
         struct temptable_entry *pEntry = sqlite3HashFind(
@@ -4550,17 +4563,13 @@ int initialize_shadow_trans(struct sqlclntstate *clnt, struct sql_thread *thd)
          * block processor on the master */
         clnt->dbtran.shadow_tran =
             trans_start_socksql(&iq, clnt->bdb_osql_trak);
-
         if (!clnt->dbtran.shadow_tran) {
            logmsg(LOGMSG_ERROR, "%s:trans_start_socksql error\n", __func__);
            return SQLITE_INTERNAL;
         }
 
-        rc = osql_sock_start(clnt, OSQL_SOCK_REQ, 0);
-        if (clnt->client_understands_query_stats)
-            osql_query_dbglog(thd, clnt->queryid);
-        sql_debug_logf(clnt, __func__, __LINE__, "osql_sock_start returns %d\n",
-                       rc);
+        clnt->osql.sock_started = 0;
+
         break;
     }
 
@@ -4731,6 +4740,7 @@ done:
 
 extern int gbl_early_verify;
 extern int gbl_osql_send_startgen;
+int gbl_forbid_incoherent_writes;
 
 /*
  ** Commit the transaction currently in progress.
@@ -4738,6 +4748,9 @@ extern int gbl_osql_send_startgen;
  ** This will release the write lock on the database file.  If there
  ** are no active cursors, it also releases the read lock.
  */
+
+void abort_dbtran(struct sqlclntstate *clnt);
+
 int sqlite3BtreeCommit(Btree *pBt)
 {
     struct sql_thread *thd = pthread_getspecific(query_info_key);
@@ -4776,6 +4789,15 @@ int sqlite3BtreeCommit(Btree *pBt)
         sql_set_sqlengine_state(clnt, __FILE__, __LINE__,
                                 SQLENG_NORMAL_PROCESS);
 
+    int64_t rows = clnt->log_effects.num_updated +
+                   clnt->log_effects.num_deleted +
+                   clnt->log_effects.num_inserted;
+    if (rows && gbl_forbid_incoherent_writes && !clnt->had_lease_at_begin) {
+        abort_dbtran(clnt);
+        errstat_cat_str(&clnt->osql.xerr, "failed write from incoherent node");
+        clnt->osql.xerr.errval = ERR_BLOCK_FAILED + ERR_VERIFY;
+        return SQLITE_ABORT;
+    }
     clnt->intrans = 0;
 
 #ifdef DEBUG_TRAN
@@ -5111,7 +5133,8 @@ int sqlite3BtreeCreateTable(Btree *pBt, int *piTable, int flags)
         return rc;
     }
 
-    assert( pBt->temp_table_mtx==thd->clnt->temp_table_mtx );
+    // TODO: The thread pool causes this to be violated.
+    // assert( pBt->temp_table_mtx==thd->clnt->temp_table_mtx );
     Pthread_mutex_lock(pBt->temp_table_mtx);
 
     if (!pBt->is_temporary) { /* must go through comdb2 to do this */
@@ -7595,6 +7618,8 @@ static int sqlite3LockStmtTables_int(sqlite3_stmt *pStmt, int after_recovery)
                 sqlite3_mutex_enter(sqlite3_db_mutex(p->db));
                 sqlite3VdbeError(p, "table \"%s\" was schema changed",
                                  tab->zName);
+                sqlite3VdbeTransferError(p);
+                sqlite3MakeSureDbHasErr(p->db, SQLITE_OK);
                 sqlite3_mutex_leave(sqlite3_db_mutex(p->db));
                 return SQLITE_SCHEMA;
             }
@@ -7627,10 +7652,10 @@ static int sqlite3LockStmtTables_int(sqlite3_stmt *pStmt, int after_recovery)
             }
 
             if (short_version != clnt->fdb_state.version) {
-                clnt->fdb_state.err.errval = SQLITE_SCHEMA;
+                clnt->fdb_state.xerr.errval = SQLITE_SCHEMA;
                 /* NOTE: first word of the error string is the actual version,
                    expected on the other side; please do not change */
-                errstat_set_strf(&clnt->fdb_state.err,
+                errstat_set_strf(&clnt->fdb_state.xerr,
                                  "%llu Stale version local %u != received %u",
                                  version, short_version,
                                  clnt->fdb_state.version);
@@ -7659,6 +7684,7 @@ static int sqlite3LockStmtTables_int(sqlite3_stmt *pStmt, int after_recovery)
                 sqlite3VdbeError(p, "table \"%s\" was schema changed",
                                  db->tablename);
                 sqlite3VdbeTransferError(p);
+                sqlite3MakeSureDbHasErr(p->db, SQLITE_OK);
                 sqlite3_mutex_leave(sqlite3_db_mutex(p->db));
 
                 return SQLITE_SCHEMA;
@@ -7882,6 +7908,15 @@ sqlite3BtreeCursor_remote(Btree *pBt,      /* The btree */
 
     cur->cursor_class = CURSORCLASS_REMOTE;
     cur->cursor_move = cursor_move_remote;
+
+    if (clnt->intrans) {
+        int rc = osql_sock_start_deferred(clnt);
+        if (rc) {
+            logmsg(LOGMSG_ERROR, "%s: failed to start sosql, rc=%d\n", __func__,
+                   rc);
+            return rc;
+        }
+    }
 
     /* set a transaction id if none is set yet */
     if ((iTable >= RTPAGE_START) && !fdb_is_sqlite_stat(fdb, cur->rootpage)) {
@@ -8774,17 +8809,6 @@ done:
 }
 
 /*
-** This function is a no-op if cursor pCur does not point to a valid row.
-** Otherwise, if pCur is valid, configure it so that the next call to
-** sqlite3BtreeNext() is a no-op.
-*/
-#ifndef SQLITE_OMIT_WINDOWFUNC
-void sqlite3BtreeSkipNext(BtCursor *pCur){
-  /* TODO: Do something here. */
-}
-#endif /* SQLITE_OMIT_WINDOWFUNC */
-
-/*
 ** Advance the cursor to the next entry in the database. 
 ** Return value:
 **
@@ -9319,7 +9343,7 @@ int put_curtran_flags(bdb_state_type *bdb_state, struct sqlclntstate *clnt,
 
     if (!clnt->dbtran.cursor_tran) {
         logmsg(LOGMSG_DEBUG, "%s called without curtran\n", __func__);
-        return -1;
+        return 0;
     }
 
     rc = bdb_put_cursortran(bdb_state, clnt->dbtran.cursor_tran, curtran_flags,
@@ -9632,6 +9656,8 @@ static int recover_deadlock_flags_int(bdb_state_type *bdb_state,
                 sqlite3_mutex_enter(sqlite3_db_mutex(cur->vdbe->db));
                 sqlite3VdbeError(cur->vdbe, "table \"%s\" was schema changed",
                                  cur->db->tablename);
+                sqlite3VdbeTransferError(cur->vdbe);
+                sqlite3MakeSureDbHasErr(cur->vdbe->db, SQLITE_OK);
                 sqlite3_mutex_leave(sqlite3_db_mutex(cur->vdbe->db));
                 return SQLITE_COMDB2SCHEMA;
             } else if (!cur->bt->is_remote && cur->db) {
@@ -10891,11 +10917,11 @@ SBUF2 *connect_remote_db(const char *protocol, const char *dbname, const char *s
               __func__, dbname, service, host);*/
             goto sbuf;
         }
-    } else
-        /*fprintf(stderr, "%s: no sockpool socket for %s.%s.%s\n",
-            __func__, dbname, service, host);*/
+    }
+    /*fprintf(stderr, "%s: no sockpool socket for %s.%s.%s\n",
+      __func__, dbname, service, host);*/
 
-        retry = 0;
+    retry = 0;
 retry:
     /* this could fail due to load */
     port = portmux_get(host, "comdb2", "replication", dbname);
@@ -12534,7 +12560,7 @@ int comdb2_check_vtab_access(sqlite3 *db, sqlite3_module *module)
                 snprintf(msg, sizeof(msg),
                          "Read access denied to %s for user %s bdberr=%d",
                          mod->zName, thd->clnt->user, bdberr);
-                logmsg(LOGMSG_WARN, "%s\n", msg);
+                logmsg(LOGMSG_INFO, "%s\n", msg);
                 errstat_set_rc(&thd->clnt->osql.xerr, SQLITE_ACCESS);
                 errstat_set_str(&thd->clnt->osql.xerr, msg);
                 return SQLITE_AUTH;
@@ -12544,4 +12570,80 @@ int comdb2_check_vtab_access(sqlite3 *db, sqlite3_module *module)
     }
     assert(0);
     return 0;
+}
+
+int _some_callback(void *theresult, int ncols, char **vals, char **cols)
+{
+    if ((ncols < 1) || (!vals[0])) {
+        logmsg(LOGMSG_ERROR, "%s query failed to retrieve a proper row!\n",
+               __func__);
+        return SQLITE_ABORT;
+    }
+
+    *(long long *)theresult = atoll(vals[0]);
+
+    return SQLITE_OK;
+}
+
+long long run_sql_return_ll(const char *sql, struct errstat *err)
+{
+    struct sql_thread *thd;
+    int rc;
+
+    thd = start_sql_thread();
+    rc = run_sql_thd_return_ll(sql, thd, err);
+    done_sql_thread();
+
+    return rc;
+}
+
+long long run_sql_thd_return_ll(const char *query, struct sql_thread *thd,
+                                struct errstat *err)
+{
+    struct sqlclntstate client;
+    sqlite3 *sqldb;
+    int rc;
+    int crc;
+    char *msg;
+    long long ret = LLONG_MIN;
+
+    reset_clnt(&client, NULL, 1);
+    strncpy(client.tzname, "UTC", sizeof(client.tzname));
+    sql_set_sqlengine_state(&client, __FILE__, __LINE__, SQLENG_NORMAL_PROCESS);
+    client.dbtran.mode = TRANLEVEL_SOSQL;
+    client.sql = (char *)query;
+    client.debug_sqlclntstate = pthread_self();
+
+    sql_get_query_id(thd);
+    thd->clnt = &client;
+
+    if ((rc = get_curtran(thedb->bdb_env, &client)) != 0) {
+        errstat_set_rcstrf(err, -1, "%s: failed to open a new curtran, rc=%d",
+                           __func__, rc);
+        goto done;
+    }
+
+    if ((rc = sqlite3_open_serial("db", &sqldb, NULL)) != 0) {
+        errstat_set_rcstrf(err, -1, "%s:sqlite3_open_serial rc %d", __func__,
+                           rc);
+        goto cleanup;
+    }
+
+    if ((rc = sqlite3_exec(sqldb, query, _some_callback, &ret, &msg)) != 0) {
+        errstat_set_rcstrf(err, -1, "q:\"%.100s\" failed rc %d: \"%.50s\"",
+                           query, rc, msg ? msg : "<unknown error>");
+        goto cleanup;
+    }
+    thd->clnt = NULL;
+
+    if ((crc = sqlite3_close(sqldb)) != 0)
+        errstat_set_rcstrf(err, -1, "close rc %d\n", crc);
+
+cleanup:
+    crc = put_curtran(thedb->bdb_env, &client);
+    if (crc && !rc)
+        errstat_set_rcstrf(err, -1, "%s: failed to close curtran", __func__);
+done:
+    thd->clnt = NULL;
+    return ret;
 }

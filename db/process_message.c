@@ -75,11 +75,12 @@ extern int __berkdb_read_alarm_ms;
 #include "crc32c.h"
 #include "ssl_bend.h"
 #include "dohsql.h"
+#include "fdb_whitelist.h"
 
-#include <trigger.h>
-#include <sc_stripes.h>
-#include <sc_global.h>
-#include <logmsg.h>
+#include "trigger.h"
+#include "sc_stripes.h"
+#include "sc_global.h"
+#include "logmsg.h"
 
 extern int gbl_exit_alarm_sec;
 extern int gbl_disable_rowlocks_logging;
@@ -135,6 +136,7 @@ void commit_bench(void *, int, int);
 void bdb_detect(void *);
 void enable_ack_trace(void);
 void disable_ack_trace(void);
+void osql_send_test(SBUF2 *sb);
 extern unsigned long long get_genid(bdb_state_type *bdb_state,
                                     unsigned int dtafile);
 int bdb_dump_logical_tranlist(void *state, FILE *f);
@@ -1150,7 +1152,7 @@ clipper_usage:
         SBUF2 *sb = sbuf2open(fileno(stdout), 0);
         cleanup_stats(sb);
     } else if (tokcmp(tok, ltok, "mallocstats") == 0) {
-#ifdef _LINUX_SOURCE
+#if defined(_LINUX_SOURCE) && !defined(__APPLE__)
         /* This is defined in malloc.h, as is struct mallinfo.  Including
          * malloc.h
          * causes a clash between mallinfo there and in dlmalloc.h. */
@@ -2549,6 +2551,30 @@ clipper_usage:
         dbgflag = toknum(tok, ltok);
         gbl_time_osql = dbgflag;
         logmsg(LOGMSG_USER, "sqllogtime %s\n", (gbl_time_osql) ? "enabled" : "disabled");
+    } else if (tokcmp(tok, ltok, "remsql_whitelist") == 0) {
+        /* expected parse line: remsql_whitelist add db1 */
+        tok = segtok(line, lline, &st, &ltok);
+        if (ltok == 0) {
+            logmsg(LOGMSG_ERROR, "Expected action\n");
+            return -1;
+        }
+        if (tokcmp(tok, ltok, "add") == 0) {
+            tok = segtok(line, lline, &st, &ltok);
+            if (ltok == 0) {
+                logmsg(LOGMSG_ERROR, "add: expected db name\n");
+                return -1;
+            }
+            fdb_add_dbname_to_whitelist(tok);
+        } else if (tokcmp(tok, ltok, "del") == 0) {
+            tok = segtok(line, lline, &st, &ltok);
+            if (ltok == 0) {
+                logmsg(LOGMSG_ERROR, "del: expected db name\n");
+                return -1;
+            }
+            fdb_del_dbname_from_whitelist(tok);
+        } else if (tokcmp(tok, ltok, "dump") == 0) {
+            fdb_dump_whitelist();
+        }
     } else if (tokcmp(tok, ltok, "fdblogtime") == 0) {
         int dbgflag;
         tok = segtok(line, lline, &st, &ltok);
@@ -3622,23 +3648,6 @@ clipper_usage:
     out:
         free(dbname);
         return 0;
-    } else if (tokcmp(tok, ltok, "testrep") == 0) {
-        int nitems;
-        int size;
-        tok = segtok(line, lline, &st, &ltok);
-        if (ltok == 0)
-            goto testrep_usage;
-        nitems = toknum(tok, ltok);
-        tok = segtok(line, lline, &st, &ltok);
-        if (ltok == 0)
-            goto testrep_usage;
-        size = toknum(tok, ltok);
-
-        testrep(nitems, size);
-        return 0;
-
-    testrep_usage:
-        logmsg(LOGMSG_ERROR, "Usage: testrep num_items item_size\n");
     } else if (tokcmp(tok, ltok, "random_lock_release_interval") == 0) {
         int tmp;
         tok = segtok(line, lline, &st, &ltok);
@@ -4174,10 +4183,6 @@ clipper_usage:
         } else {
             logmsg(LOGMSG_USER, "DDLK generator turned off\n");
         }
-    } else if (tokcmp(tok, ltok, "locktest") == 0) {
-        Pthread_mutex_lock(&testguard);
-        bdb_locktest(thedb->bdb_env);
-        Pthread_mutex_unlock(&testguard);
     } else if (tokcmp(tok, ltok, "berkdelay") == 0) {
         uint32_t commit_delay_ms = 0;
         tok = segtok(line, lline, &st, &ltok);
@@ -4748,6 +4753,33 @@ clipper_usage:
         }
     } else if (tokcmp(tok, ltok, "logmsg") == 0) {
         logmsg_process_message(line, lline);
+    } else if (tokcmp(tok, ltok, "test") == 0) { //@send test <keyword>
+        tok = segtok(line, lline, &st, &ltok);
+        if (tokcmp(tok, ltok, "bdb_lock") == 0) { // was locktest
+            Pthread_mutex_lock(&testguard);
+            bdb_locktest(thedb->bdb_env);
+            Pthread_mutex_unlock(&testguard);
+        } else if (tokcmp(tok, ltok, "bad_osql") == 0) {
+            SBUF2 *sb = sbuf2open(fileno(stdout), 0);
+            osql_send_test(sb);
+        } else if (tokcmp(tok, ltok, "rep") == 0) { // was testrep
+            int nitems;
+            int size;
+            tok = segtok(line, lline, &st, &ltok);
+            if (ltok == 0)
+                goto testrep_usage;
+            nitems = toknum(tok, ltok);
+            tok = segtok(line, lline, &st, &ltok);
+            if (ltok == 0)
+                goto testrep_usage;
+            size = toknum(tok, ltok);
+
+            testrep(nitems, size);
+            return 0;
+
+        testrep_usage:
+            logmsg(LOGMSG_ERROR, "Usage: testrep num_items item_size\n");
+        }
     } else {
         // see if any plugins know how to handle this
         struct message_handler *h;

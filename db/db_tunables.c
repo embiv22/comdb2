@@ -38,6 +38,7 @@
 #define COMPOSITE_TUNABLE_SEP '.'
 
 extern int gbl_allow_lua_print;
+extern int gbl_allow_lua_exec_with_ddl;
 extern int gbl_allow_lua_dynamic_libs;
 extern int gbl_allow_pragma;
 extern int gbl_berkdb_epochms_repts;
@@ -162,6 +163,9 @@ extern int gbl_getlock_latencyms;
 extern int gbl_last_locked_seqnum;
 extern int gbl_set_coherent_state_trace;
 extern int gbl_force_incoherent;
+extern int gbl_ignore_coherency;
+extern int gbl_skip_catchup_logic;
+extern int gbl_forbid_incoherent_writes;
 extern int gbl_durable_set_trace;
 extern int gbl_set_seqnum_trace;
 extern int gbl_enque_log_more;
@@ -214,6 +218,8 @@ extern int gbl_physrep_reconnect_penalty;
 extern int gbl_physrep_register_interval;
 extern int gbl_logdelete_lock_trace;
 extern int gbl_flush_log_at_checkpoint;
+extern int gbl_online_recovery;
+extern int gbl_forbid_remote_admin;
 
 extern long long sampling_threshold;
 
@@ -785,6 +791,13 @@ static int sql_tranlevel_default_update(void *context, void *value)
     logmsg(LOGMSG_USER, "Set default transaction level to %s\n",
            (char *)sql_tranlevel_default_value(NULL));
     return 0;
+}
+
+static int pbkdf2_iterations_update(void *context, void *value)
+{
+    extern int set_pbkdf2_iterations(int val);
+    (void)context;
+    return set_pbkdf2_iterations(*(int *)value);
 }
 
 /* Routines for the tunable system itself - tunable-specific
