@@ -27,6 +27,7 @@
 #include <util.h>
 #include "debug_switches.h"
 #include "logmsg.h"
+#include "str0.h"
 #endif /* defined(SQLITE_BUILDING_FOR_COMDB2) */
 
 #ifdef SQLITE_DEBUG
@@ -214,10 +215,7 @@ SQLITE_NOINLINE int sqlite3VdbeMemGrow(Mem *pMem, int n, int bPreserve){
 
   /* If the bPreserve flag is set to true, then the memory cell must already
   ** contain a valid string or blob value.  */
-  assert( bPreserve==0 
-       || pMem->flags&(MEM_Blob|MEM_Str)
-       || MemNullNochng(pMem)
-  );
+  assert( bPreserve==0 || pMem->flags&(MEM_Blob|MEM_Str) );
   testcase( bPreserve && pMem->z==0 );
 
 #if !defined(SQLITE_BUILDING_FOR_COMDB2)
@@ -347,6 +345,7 @@ int sqlite3VdbeMemExpandBlob(Mem *pMem){
   /* Set nByte to the number of bytes required to store the expanded blob. */
   nByte = pMem->n + pMem->u.nZero;
   if( nByte<=0 ){
+    if( (pMem->flags & MEM_Blob)==0 ) return SQLITE_OK;
     nByte = 1;
   }
   if( sqlite3VdbeMemGrow(pMem, nByte, 1) ){
@@ -1327,7 +1326,7 @@ int sqlite3VdbeMemSetStr(
       nAlloc += (enc==SQLITE_UTF8?1:2);
     }
     if( nByte>iLimit ){
-      return SQLITE_TOOBIG;
+      return sqlite3ErrorToParser(pMem->db, SQLITE_TOOBIG);
     }
     testcase( nAlloc==0 );
     testcase( nAlloc==31 );
@@ -1838,7 +1837,7 @@ static int valueFromExpr(
   }else if( op==TK_NULL ){
     pVal = valueNew(db, pCtx);
     if( pVal==0 ) goto no_mem;
-    sqlite3VdbeMemNumerify(pVal);
+    sqlite3VdbeMemSetNull(pVal);
   }
 #ifndef SQLITE_OMIT_BLOB_LITERAL
   else if( op==TK_BLOB ){
@@ -2332,16 +2331,14 @@ int sqlite3VdbeMemDatetimefyTz(Mem *pMem, const char *tz){
      &pMem->du.dt, pMem->dtprec) != 0) {
       return SQLITE_ERROR;
     }
-    pMem->flags = MEM_Datetime;
-    /* all is good, get rid of the string, which is user-provided and partial
-       many times */
-    if( pMem->flags & MEM_Dyn ){
-        sqlite3DbFree(pMem->db, pMem->z);
+    if( pMem->szMalloc ){
+      sqlite3DbFreeNN(pMem->db, pMem->zMalloc);
+      pMem->szMalloc = 0;
     }
     pMem->n = 0;
     pMem->z = 0;
     /*no MEM_Blob here*/
-    pMem->flags &= ~(MEM_Str|MEM_Static|MEM_Dyn|MEM_Ephem);
+    pMem->flags = MEM_Datetime;
   }
   return SQLITE_OK;
 }
@@ -2945,7 +2942,7 @@ static int _dttz_to_native_datetime(cdb2_client_datetime_t * cdt, const Mem *inp
     bzero(&tzopts, sizeof(tzopts));
     tzopts.flags |= 2 /*FLD_CONV_TZONE*/;
     if( !inp->tz ) return SQLITE_ERROR;
-    strncpy(tzopts.tzname, inp->tz, sizeof(tzopts.tzname));
+    strncpy0(tzopts.tzname, inp->tz, sizeof(tzopts.tzname));
 
     /* ugly, arghh */
     bzero(tmp, sizeof(tmp));
@@ -2992,7 +2989,7 @@ static int _dttz_to_native_datetimeus(cdb2_client_datetimeus_t * cdt, const Mem 
     bzero(&tzopts, sizeof(tzopts));
     tzopts.flags |= 2 /*FLD_CONV_TZONE*/;
     if(!inp->tz) return SQLITE_ERROR;
-    strncpy(tzopts.tzname, inp->tz, sizeof(tzopts.tzname));
+    strncpy0(tzopts.tzname, inp->tz, sizeof(tzopts.tzname));
 
     /* ugly, arghh */
     bzero(tmp, sizeof(tmp));
@@ -3218,9 +3215,12 @@ int sqliteVdbeMemDecimalBasicArithmetics(
 
   bzero(&bcopy, sizeof(Mem));
   bzero(res, sizeof(Mem));
-  res->flags |= MEM_Interval;
 
   switch( b->flags & MEM_TypeMask ){
+    case MEM_Null: {
+      sqlite3VdbeMemSetNull(res);
+      break;
+    }
     case MEM_Int:
     case MEM_Str: {
       sqlite3VdbeMemCopy(&bcopy, b);
@@ -3296,6 +3296,7 @@ int sqliteVdbeMemDecimalBasicArithmetics(
         }
       }
 
+      res->flags |= MEM_Interval;
       res->du.tv.type = INTV_DECIMAL_TYPE;
       res->du.tv.sign = 0;
       break;

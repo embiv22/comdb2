@@ -54,6 +54,15 @@
 
 #if defined(SQLITE_BUILDING_FOR_COMDB2)
 #include "comdb2Int.h"  /* ALL CUSTOM HEADERS ARE INCLUDED FROM HERE) */
+
+#define TRAN_ERROR      "BEGIN, COMMIT, and ROLLBACK statements cannot be "   \
+                        "prepared or executed directly against SQL engine "   \
+                        "instances (e.g. via Lua stored procedures, etc). "   \
+                        "Instead, a custom set of Lua commands must be used," \
+                        "e.g. db:begin.  Other than Lua, these statements "   \
+                        "are normally handled directly by code within the "   \
+                        "subsystem used to prepare SQL queries for worker "   \
+                        "threads."
 #endif /* defined(SQLITE_BUILDING_FOR_COMDB2) */
 
 /*
@@ -141,7 +150,12 @@ cmdx ::= cmd.           { sqlite3FinishCoding(pParse); }
 ///////////////////// Begin and end transactions. ////////////////////////////
 //
 
+%ifdef SQLITE_BUILDING_FOR_COMDB2
+cmd ::= BEGIN transtype(Y) trans_opt.  {sqlite3ErrorMsg(pParse, TRAN_ERROR, Y);}
+%endif SQLITE_BUILDING_FOR_COMDB2
+%ifndef SQLITE_BUILDING_FOR_COMDB2
 cmd ::= BEGIN transtype(Y) trans_opt.  {sqlite3BeginTransaction(pParse, Y);}
+%endif !SQLITE_BUILDING_FOR_COMDB2
 trans_opt ::= .
 trans_opt ::= TRANSACTION.
 trans_opt ::= TRANSACTION nm.
@@ -150,19 +164,37 @@ transtype(A) ::= .             {A = TK_DEFERRED;}
 transtype(A) ::= DEFERRED(X).  {A = @X; /*A-overwrites-X*/}
 transtype(A) ::= IMMEDIATE(X). {A = @X; /*A-overwrites-X*/}
 transtype(A) ::= EXCLUSIVE(X). {A = @X; /*A-overwrites-X*/}
+%ifdef SQLITE_BUILDING_FOR_COMDB2
+cmd ::= COMMIT|END(X) trans_opt.   {sqlite3ErrorMsg(pParse, TRAN_ERROR, @X);}
+cmd ::= ROLLBACK(X) trans_opt.     {sqlite3ErrorMsg(pParse, TRAN_ERROR, @X);}
+%endif SQLITE_BUILDING_FOR_COMDB2
+%ifndef SQLITE_BUILDING_FOR_COMDB2
 cmd ::= COMMIT|END(X) trans_opt.   {sqlite3EndTransaction(pParse,@X);}
 cmd ::= ROLLBACK(X) trans_opt.     {sqlite3EndTransaction(pParse,@X);}
+%endif !SQLITE_BUILDING_FOR_COMDB2
 
 savepoint_opt ::= SAVEPOINT.
 savepoint_opt ::= .
 cmd ::= SAVEPOINT nm(X). {
+#if defined(SQLITE_BUILDING_FOR_COMDB2)
+  sqlite3ErrorMsg(pParse, TRAN_ERROR, &X);
+#else /* defined(SQLITE_BUILDING_FOR_COMDB2) */
   sqlite3Savepoint(pParse, SAVEPOINT_BEGIN, &X);
+#endif /* defined(SQLITE_BUILDING_FOR_COMDB2) */
 }
 cmd ::= RELEASE savepoint_opt nm(X). {
+#if defined(SQLITE_BUILDING_FOR_COMDB2)
+  sqlite3ErrorMsg(pParse, TRAN_ERROR, &X);
+#else /* defined(SQLITE_BUILDING_FOR_COMDB2) */
   sqlite3Savepoint(pParse, SAVEPOINT_RELEASE, &X);
+#endif /* defined(SQLITE_BUILDING_FOR_COMDB2) */
 }
 cmd ::= ROLLBACK trans_opt TO savepoint_opt nm(X). {
+#if defined(SQLITE_BUILDING_FOR_COMDB2)
+  sqlite3ErrorMsg(pParse, TRAN_ERROR, &X);
+#else /* defined(SQLITE_BUILDING_FOR_COMDB2) */
   sqlite3Savepoint(pParse, SAVEPOINT_ROLLBACK, &X);
+#endif /* defined(SQLITE_BUILDING_FOR_COMDB2) */
 }
 
 ///////////////////// The CREATE TABLE statement ////////////////////////////
@@ -282,7 +314,8 @@ columnname(A) ::= nm(A) typetoken(Y). {sqlite3AddColumn(pParse,&A,&Y);}
   BLOBFIELD BULKIMPORT
   CHECK COMMITSLEEP CONSUMER CONVERTSLEEP COUNTER COVERAGE CRLE
   DATA DATABLOB DATACOPY DBPAD DEFERRABLE DISABLE DISTRIBUTION DRYRUN
-  ENABLE FUNCTION GENID48 GET GRANT IPU ISC KW LUA LZ4 NONE
+  ENABLE EXEC EXECUTE FUNCTION GENID48 GET GRANT INCREMENT IPU ISC KW
+  LUA LZ4 NONE
   ODH OFF OP OPTION OPTIONS
   PAGEORDER PASSWORD PAUSE PERIOD PENDING PROCEDURE PUT
   REBUILD READ READONLY REC RESERVED RESUME RETENTION REVOKE RLE ROWLOCKS
@@ -546,6 +579,8 @@ tcons ::= FOREIGN KEY LP eidlist(FA) RP
     comdb2CreateForeignKey(pParse, FA, &T, TA, R);
     comdb2DeferForeignKey(pParse, D);
 }
+tcons ::= CHECK LP scanpt(BW) expr(E) scanpt(AW) RP.
+                                 {comdb2AddCheckConstraint(pParse,E,BW,AW);}
 %endif SQLITE_BUILDING_FOR_COMDB2
 %ifndef SQLITE_BUILDING_FOR_COMDB2
 tcons ::= CHECK LP expr(E) RP onconf.
@@ -1565,21 +1600,12 @@ uniqueflag(A) ::= .        {A = OE_None;}
     int sortOrder
   ){
     ExprList *p = sqlite3ExprListAppend(pParse, pPrior, 0);
-#if defined(SQLITE_BUILDING_FOR_COMDB2)
-    /* Allow sort order in FK index columns. */
-    if( hasCollate && pParse->db->init.busy==0)
-    {
-      sqlite3ErrorMsg(pParse, "syntax error after column name \"%.*s\"",
-                         pIdToken->n, pIdToken->z);
-    }
-#else /* defined(SQLITE_BUILDING_FOR_COMDB2) */
     if( (hasCollate || sortOrder!=SQLITE_SO_UNDEFINED)
         && pParse->db->init.busy==0
     ){
       sqlite3ErrorMsg(pParse, "syntax error after column name \"%.*s\"",
                          pIdToken->n, pIdToken->z);
     }
-#endif /* defined(SQLITE_BUILDING_FOR_COMDB2) */
     sqlite3ExprListSetName(pParse, p, pIdToken, 1);
 #if defined(SQLITE_BUILDING_FOR_COMDB2)
     sqlite3ExprListSetSortOrder(p, sortOrder);
@@ -1840,6 +1866,10 @@ tconsfk ::= constraint_opt FOREIGN KEY LP eidlist(FA) RP REFERENCES nm(T)
   comdb2DeferForeignKey(pParse, D);
 }
 
+tconscheck ::= constraint_opt CHECK LP scanpt(BW) expr(E) scanpt(AW) RP. {
+  comdb2AddCheckConstraint(pParse,E,BW,AW);
+}
+
 cmd ::= alter_table_csc2.
 cmd ::= alter_table alter_table_action_list. {comdb2AlterTableEnd(pParse);}
 
@@ -1893,6 +1923,10 @@ alter_table_add_fk ::= ADD tconsfk.
 alter_table_drop_fk ::= DROP FOREIGN KEY nm(Y). {
   comdb2DropForeignKey(pParse, &Y);
 }
+alter_table_add_check_cons ::= ADD tconscheck.
+alter_table_drop_cons ::= DROP CONSTRAINT nm(Y). {
+  comdb2DropConstraint(pParse, &Y);
+}
 
 alter_table_add_index ::= ADD uniqueflag(U) INDEX nm(I) LP sortlist(X) RP
                           with_opt(O) where_opt(W). {
@@ -1913,6 +1947,8 @@ alter_table_action ::= alter_table_add_pk.
 alter_table_action ::= alter_table_drop_pk.
 alter_table_action ::= alter_table_add_fk.
 alter_table_action ::= alter_table_drop_fk.
+alter_table_action ::= alter_table_add_check_cons.
+alter_table_action ::= alter_table_drop_cons.
 alter_table_action ::= alter_table_add_index.
 alter_table_action ::= alter_table_drop_index.
 alter_table_action ::= alter_table_commit_pending.
@@ -1990,6 +2026,16 @@ wqlist(A) ::= wqlist(A) COMMA nm(X) eidlist_opt(Y) AS LP select(Z) RP. {
 ////////////////////////// COMDB2 SYNTAX EXTENSIONS ///////////////////////////
 // These rules are used to support the syntax extensions provided by COMDB2.
 %ifdef SQLITE_BUILDING_FOR_COMDB2
+//////////////////////////////// EXEC / EXECUTE ///////////////////////////////
+cmd ::= EXEC sproccmd.
+cmd ::= EXECUTE sproccmd.
+
+exec_proc_arg ::= NULL|FLOAT|BLOB|STRING|INTEGER.
+exec_proc_arg_list ::= exec_proc_arg.
+exec_proc_arg_list ::= exec_proc_arg_list COMMA exec_proc_arg.
+
+sproccmd ::= PROCEDURE ids LP exec_proc_arg_list RP.
+
 ////////////////////////////////// GET / PUT //////////////////////////////////
 cmd ::= GET getcmd.
 
@@ -2122,8 +2168,10 @@ putcmd ::= SCHEMACHANGE CONVERTSLEEP INTEGER(F). {
     comdb2schemachangeConvertsleep(pParse, tmp);
 }
 
-putcmd ::= TUNABLE nm(N) INTEGER|FLOAT|STRING(M). {
-    comdb2putTunable(pParse, &N, &M);
+opteq ::= .
+opteq ::= EQ .
+putcmd ::= TUNABLE nm(N) dbnm(M) opteq INTEGER|FLOAT|STRING(V). {
+    comdb2putTunable(pParse, &N, &M, &V);
 }
 
 /////////////////////////////////// REBUILD ///////////////////////////////////
@@ -2246,6 +2294,10 @@ cmd ::= ANALYZE nm(N) dbnm(Y) analyzepercentage(P) analyzeopt(X). {
     comdb2analyze(pParse, X, &N, &Y, P);
 }
 
+cmd ::= ANALYZE ALL analyzepercentage(P) analyzeopt(X). {
+    comdb2analyze(pParse, X, NULL, NULL, P);
+}
+
 cmd ::= ANALYZE analyzepercentage(P) analyzeopt(X). {
     comdb2analyze(pParse, X, NULL, NULL, P);
 }
@@ -2345,13 +2397,20 @@ cmd ::= createkw PROCEDURE nm(N) NOSQL(X). {
 }
 cmd ::= createkw PROCEDURE nm(N) VERSION STRING(V) NOSQL(X). {
     comdb2CreateProcedure(pParse, &N, &V, &X);
+}
 
 /////////////////////////////// DROP PROCEDURE ////////////////////////////////
-}
+
 cmd ::= DROP PROCEDURE nm(N) INTEGER(V). {
     comdb2DropProcedure(pParse, &N, &V, 0);
 }
+cmd ::= DROP PROCEDURE nm(N) VERSION INTEGER(V). {
+    comdb2DropProcedure(pParse, &N, &V, 0);
+}
 cmd ::= DROP PROCEDURE nm(N) STRING(V). {
+    comdb2DropProcedure(pParse, &N, &V, 1);
+}
+cmd ::= DROP PROCEDURE nm(N) VERSION STRING(V). {
     comdb2DropProcedure(pParse, &N, &V, 1);
 }
 

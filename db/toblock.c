@@ -82,7 +82,6 @@
 int (*comdb2_ipc_swapnpasdb_sinfo)(struct ireq *) = 0;
 
 extern int is_buffer_from_remote(const void *buf);
-
 extern pthread_t gbl_invalid_tid;
 extern int gbl_enable_berkdb_retry_deadlock_bias;
 extern int gbl_osql_verify_retries_max;
@@ -94,6 +93,14 @@ extern pthread_mutex_t commit_stat_lk;
 extern pthread_mutex_t osqlpf_mutex;
 extern int gbl_prefault_udp;
 extern int gbl_reorder_socksql_no_deadlock;
+extern int gbl_reorder_idx_writes;
+extern int gbl_print_blockp_stats;
+extern int gbl_dump_blkseq;
+extern __thread int send_prefault_udp;
+extern void delay_if_sc_resuming(struct ireq *iq);
+extern unsigned int gbl_delayed_skip;
+
+int gbl_osql_snap_info_hashcheck = 1;
 
 #if 0
 #define GOTOBACKOUT                                                            \
@@ -146,9 +153,9 @@ static int block2_qadd(struct ireq *iq, block_state_t *p_blkstate, void *trans,
 
     if (buf->qnamelen > sizeof(qname) - 1) {
         if (iq->debug)
-            reqprintf(iq, "NAME TOO LONG %d>%d", buf->qnamelen,
+            reqprintf(iq, "NAME TOO LONG %u>%zu", buf->qnamelen,
                       sizeof(qname) - 1);
-        reqerrstr(iq, COMDB2_CUST_RC_NAME_SZ, "queue name to long %d>%d",
+        reqerrstr(iq, COMDB2_CUST_RC_NAME_SZ, "queue name to long %u>%zu",
                   buf->qnamelen, sizeof(qname) - 1);
         return ERR_BADREQ;
     }
@@ -178,7 +185,7 @@ static int block2_qadd(struct ireq *iq, block_state_t *p_blkstate, void *trans,
 
     if (!blobs[0].exists) {
         if (iq->debug)
-            reqprintf(iq, "EXPECTED ONE BLOB", cblob);
+            reqprintf(iq, "EXPECTED AT LEAST ONE BLOB");
         reqerrstr(iq, COMDB2_QADD_RC_BAD_BLOB_BUFF,
                   "expected one blob (internal api error)");
         return ERR_BADREQ;
@@ -324,7 +331,7 @@ void toblock_init(void)
 #undef add_blockop
     /* a runtime assert to make sure we have the right size of blockop count
      * array */
-    if (index > NUM_BLOCKOP_OPCODES) {
+    if (index >= NUM_BLOCKOP_OPCODES) {
         logmsg(LOGMSG_FATAL, "%s: too many blockops defined!\n", __func__);
         logmsg(LOGMSG_FATAL, "%s: you need to increase NUM_BLOCKOP_OPCODES to %d\n",
                 __func__, index);
@@ -464,7 +471,7 @@ static int forward_longblock_to_master(struct ireq *iq,
     /*have a valid master to pass this off to. */
     if (iq->debug)
         reqprintf(iq, "forwarded req from %s to master node %s db %d rqlen "
-                      "%d\n",
+                      "%zu\n",
                   getorigin(iq), mstr, iq->origdb->dbnum, req_len);
     if (iq->is_socketrequest) {
         if (iq->sb == NULL) {
@@ -524,7 +531,7 @@ static int forward_block_to_master(struct ireq *iq, block_state_t *p_blkstate,
 
     if (iq->debug)
         reqprintf(iq, "forwarded req from %s to master node %s db %d rqlen "
-                      "%d\n",
+                      "%zu\n",
                   getorigin(iq), mstr, iq->origdb->dbnum, req_len);
 
     if (iq->is_socketrequest) {
@@ -758,8 +765,6 @@ static void block_state_free(block_state_t *p_blkstate)
     p_blkstate->p_buf_saved_start = NULL;
 }
 
-extern int gbl_dump_blkseq;
-
 unsigned long long blkseq_replay_count = 0;
 unsigned long long blkseq_replay_error_count = 0;
 
@@ -787,9 +792,10 @@ static int do_replay_case(struct ireq *iq, void *fstseqnum, int seqlen,
 
     if (!replay_data) {
 
-        if (!iq->have_snap_info)
+        if (!iq->have_snap_info) {
             assert( (seqlen == (sizeof(fstblkseq_t))) || 
                     (seqlen == (sizeof(uuid_t))));
+        }
 
         rc = bdb_blkseq_find(thedb->bdb_env, NULL, fstseqnum, seqlen,
                              &replay_data, &replay_data_len);
@@ -950,14 +956,10 @@ static int do_replay_case(struct ireq *iq, void *fstseqnum, int seqlen,
                 if (!(p_fstblk_buf = (uint8_t *)buf_get(&(snapinfo_outrc), sizeof(snapinfo_outrc), 
                         p_fstblk_buf, p_fstblk_buf_end)))  {
                     abort();
-                    blkseq_line = __LINE__;
-                    goto replay_error;
                 }
                 if (!(p_fstblk_buf = (uint8_t *)osqlcomm_errstat_type_get(&(iq->errstat), 
                         p_fstblk_buf, p_fstblk_buf_end))) {
                     abort();
-                    blkseq_line = __LINE__;
-                    goto replay_error;
                 }
             }
 
@@ -1095,8 +1097,7 @@ static int do_replay_case(struct ireq *iq, void *fstseqnum, int seqlen,
 
     if (gbl_dump_blkseq && iq->have_snap_info) {
         logmsg(LOGMSG_USER,
-               "Replay case for '%s' rc=%d, errval=%d errstr='%s' "
-               "rcout=%d\n",
+               "Replay case for '%s' rc=%d, errval=%d errstr='%s' rcout=%d\n",
                cnonce, outrc, iq->errstat.errval, iq->errstat.errstr,
                iq->sorese.rcout);
     }
@@ -2348,8 +2349,6 @@ static int extract_blkseq2(struct ireq *iq, block_state_t *p_blkstate,
 
 static pthread_rwlock_t commit_lock = PTHREAD_RWLOCK_INITIALIZER;
 
-extern __thread int send_prefault_udp;
-extern void delay_if_sc_resuming(struct ireq *iq);
 
 void handle_postcommit_bpfunc(struct ireq *iq)
 {
@@ -2562,7 +2561,8 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
     int have_blkseq = 0;
     bool have_keyless_requests = 0;
     int numerrs = 0;
-    int constraint_violation = 0;
+    int check_serializability = 0;
+    int force_serial_error = 0;
     struct block_err err;
     int opcode_counts[NUM_BLOCKOP_OPCODES];
     int nops = 0;
@@ -2645,6 +2645,10 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
     if (lrc)
         return lrc;
 
+    uint64_t strt = comdb2_time_epochus();
+    reqlog_set_queue_time(iq->reqlogger, strt - iq->startus);
+    reqlog_set_startprcs(iq->reqlogger, strt);
+
     /* adding this back temporarily so I can get blockop counts again. this
        really just belongs in the main loop (should get its own logger event
        flag and logger events for this flag should be reset in the case of a
@@ -2721,9 +2725,14 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
         }
 
         if (got_osql && iq->have_snap_info) {
+            if (gbl_osql_snap_info_hashcheck) {
+                // the goal here is to stall until the original transaction
+                // has finished that way we can retrieve the outcome from blkseq
+                osql_blkseq_register_cnonce(iq);
+            }
+
             void *replay_data = NULL;
             int replay_len = 0;
-            int findout;
             bdb_get_readlock(thedb->bdb_env, "early_replay_cnonce", __func__,
                              __LINE__);
             if (thedb->master != gbl_mynode) {
@@ -2732,11 +2741,13 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
                 fromline = __LINE__;
                 goto cleanup;
             }
-            findout = bdb_blkseq_find(thedb->bdb_env, parent_trans,
-                                      iq->snap_info.key, iq->snap_info.keylen,
-                                      &replay_data, &replay_len);
-            if (findout == 0) {
-                logmsg(LOGMSG_WARN, "early snapinfo blocksql replay detected\n");
+            int found;
+            found = bdb_blkseq_find(thedb->bdb_env, parent_trans,
+                                    iq->snap_info.key, iq->snap_info.keylen,
+                                    &replay_data, &replay_len);
+            if (!found) {
+                logmsg(LOGMSG_WARN,
+                       "early snapinfo blocksql replay detected\n");
                 outrc = do_replay_case(iq, iq->snap_info.key,
                                        iq->snap_info.keylen, num_reqs, 0,
                                        replay_data, replay_len, __LINE__);
@@ -4185,7 +4196,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
                 } else if (qblob.length != blob->length) {
                     reqerrstr(iq, COMDB2_BLOB_RC_RCV_BAD_LENGTH,
                               "bad fragment for blob %d gives length %u "
-                              "expected %u",
+                              "expected %zu",
                               qblob.blobno, qblob.length, blob->length);
                     rc = ERR_BADREQ;
                     GOTOBACKOUT;
@@ -4195,7 +4206,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
                     if (qblob.frag_len + blob->collected > blob->length) {
                         reqerrstr(iq, COMDB2_BLOB_RC_RCV_TOO_MUCH,
                                   "received too much data for blob %d "
-                                  "(I had %u/%u bytes, received another "
+                                  "(I had %zu/%zu bytes, received another "
                                   "%u)",
                                   qblob.blobno, blob->collected, blob->length,
                                   qblob.frag_len);
@@ -4718,6 +4729,10 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
         if (gbl_prefault_udp)
             send_prefault_udp = 1;
         rc = osql_bplog_commit(iq, trans, &tmpnops, &err);
+        if (rc == ERR_VERIFY) {
+            check_serializability = 1;
+            force_serial_error = 1;
+        }
         send_prefault_udp = 0;
 
         if (iq->osql_step_ix) {
@@ -4761,7 +4776,26 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
     ixout = -1;
     errout = 0;
 
-    if (delayed || gbl_goslow) {
+    if (delayed || gbl_goslow || gbl_reorder_idx_writes) {
+
+        if (gbl_reorder_idx_writes) {
+            if (iq->debug)
+                reqpushprefixf(iq, "process_defered_table:");
+            rc = process_defered_table(iq, p_blkstate, trans, &blkpos, &ixout,
+                                       &errout);
+            if (iq->debug)
+                reqpopprefixes(iq, 1);
+
+            if (rc != 0) {
+                opnum = blkpos; /* so we report the failed blockop accurately */
+                err.blockop_num = blkpos;
+                err.errcode = errout;
+                err.ixnum = ixout;
+                numerrs = 1;
+                reqlog_set_error(iq->reqlogger, "Process Defered Table", rc);
+                GOTOBACKOUT;
+            }
+        }
 
         if (iq->debug)
             reqpushprefixf(iq, "delayed_key_adds: %p", trans);
@@ -4773,7 +4807,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
             reqpopprefixes(iq, 1);
 
         if (rc != 0) {
-            constraint_violation = 1;
+            check_serializability = 1;
             opnum = blkpos; /* so we report the failed blockop accurately */
             err.blockop_num = blkpos;
             err.errcode = errout;
@@ -4787,13 +4821,12 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
 
         if (iq->debug)
             reqpushprefixf(iq, "verify_del_constraints: %p", trans);
-        rc = verify_del_constraints(javasp_trans_handle, iq, p_blkstate, trans,
-                                    blobs, &verror);
+        rc = verify_del_constraints(iq, p_blkstate, trans, blobs, &verror);
         if (iq->debug)
             reqpopprefixes(iq, 1);
 
         if (rc != 0) {
-            constraint_violation = 1;
+            check_serializability = 1;
             err.blockop_num = 0;
             err.errcode = verror;
             err.ixnum = -1;
@@ -4805,13 +4838,12 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
         if (iq->debug)
             reqpushprefixf(iq, "verify_add_constraints: %p", trans);
 
-        rc = verify_add_constraints(javasp_trans_handle, iq, p_blkstate, trans,
-                                    &verror);
+        rc = verify_add_constraints(iq, p_blkstate, trans, &verror);
         if (iq->debug)
             reqpopprefixes(iq, 1);
 
         if (rc != 0) {
-            constraint_violation = 1;
+            check_serializability = 1;
             err.blockop_num = 0;
             err.errcode = verror;
             err.ixnum = -1;
@@ -4822,7 +4854,6 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
 
     } /* end delayed */
     else {
-        extern unsigned int gbl_delayed_skip;
         ++gbl_delayed_skip;
     }
 
@@ -4855,18 +4886,6 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
             GOTOBACKOUT;
     }
 
-    /* Trigger JAVASP_TRANS_LISTEN_BEFORE_COMMIT. */
-    thrman_wheref(thr_self, "%s [javasp pre commit hooks]", req2a(iq->opcode));
-    rc = javasp_trans_misc_trigger(javasp_trans_handle,
-                                   JAVASP_TRANS_LISTEN_BEFORE_COMMIT);
-    if (rc != 0) {
-        err.blockop_num = 0;
-        err.errcode = OP_FAILED_INTERNAL + ERR_JAVASP_ABORT_OP;
-        err.ixnum = -1;
-        numerrs = 1;
-        GOTOBACKOUT;
-    }
-
     Pthread_rwlock_rdlock(&commit_lock);
     hascommitlock = 1;
     if (iq->arr || iq->selectv_arr) {
@@ -4875,6 +4894,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
         Pthread_rwlock_wrlock(&commit_lock);
         hascommitlock = 1;
 
+        /* This is looking for a commit record - one dive is fine */
         while ((iq->arr &&
                 bdb_osql_serial_check(thedb->bdb_env, iq->arr, &(iq->arr->file),
                                       &(iq->arr->offset), 1)) ||
@@ -4884,19 +4904,11 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
                                       &(iq->selectv_arr->offset), 1))) {
             Pthread_rwlock_unlock(&commit_lock);
             hascommitlock = 0;
-            if (iq->arr &&
-                bdb_osql_serial_check(thedb->bdb_env, iq->arr, &(iq->arr->file),
-                                      &(iq->arr->offset), 0)) {
-                currangearr_free(iq->arr);
-                iq->arr = NULL;
-                numerrs = 1;
-                rc = ERR_NOTSERIAL;
-                reqerrstr(iq, ERR_NOTSERIAL, "transaction is not serializable");
-                GOTOBACKOUT;
-            } else if (iq->selectv_arr &&
-                       bdb_osql_serial_check(thedb->bdb_env, iq->selectv_arr,
-                                             &(iq->selectv_arr->file),
-                                             &(iq->selectv_arr->offset), 0)) {
+
+            if (iq->selectv_arr &&
+                bdb_osql_serial_check(thedb->bdb_env, iq->selectv_arr,
+                                      &(iq->selectv_arr->file),
+                                      &(iq->selectv_arr->offset), 0)) {
                 currangearr_free(iq->selectv_arr);
                 iq->selectv_arr = NULL;
                 numerrs = 1;
@@ -4907,6 +4919,19 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
 
                 rc = ERR_CONSTR;
                 reqerrstr(iq, COMDB2_CSTRT_RC_INVL_REC, "selectv constraints");
+                GOTOBACKOUT;
+            } else if (iq->arr && bdb_osql_serial_check(
+                                      thedb->bdb_env, iq->arr, &(iq->arr->file),
+                                      &(iq->arr->offset), 0)) {
+                currangearr_free(iq->arr);
+                iq->arr = NULL;
+                numerrs = 1;
+                rc = ERR_NOTSERIAL;
+
+                /* Check selectv_arr in backout code */
+                if (iq->selectv_arr)
+                    check_serializability = 1;
+                reqerrstr(iq, ERR_NOTSERIAL, "transaction is not serializable");
                 GOTOBACKOUT;
             } else {
                 Pthread_rwlock_wrlock(&commit_lock);
@@ -5071,14 +5096,35 @@ backout:
      * serializable error and a dup-key constraint we should return the 
      * serializable error as the dup-key may have been caused by the 
      * conflicting write. */
-    if (constraint_violation && iq->arr &&
-        bdb_osql_serial_check(thedb->bdb_env, iq->arr, &(iq->arr->file),
-                &(iq->arr->offset), 0)) {
-        currangearr_free(iq->arr);
-        iq->arr = NULL;
-        numerrs = 1;
-        rc = ERR_NOTSERIAL;
-        reqerrstr(iq, ERR_NOTSERIAL, "transaction is not serializable");
+    if (check_serializability) {
+        /* Check serial and selectv readsets independently, serial first to
+         * eliminate the race: selectv-error should override serial error */
+        if (iq->arr && (force_serial_error ||
+                               bdb_osql_serial_check(thedb->bdb_env, iq->arr,
+                                                     &(iq->arr->file),
+                                                     &(iq->arr->offset), 0))) {
+            numerrs = 1;
+            currangearr_free(iq->arr);
+            iq->arr = NULL;
+            rc = ERR_NOTSERIAL;
+            reqerrstr(iq, ERR_NOTSERIAL, "transaction is not serializable");
+        }
+
+        if (iq->selectv_arr &&
+            bdb_osql_serial_check(thedb->bdb_env, iq->selectv_arr,
+                                  &(iq->selectv_arr->file),
+                                  &(iq->selectv_arr->offset), 0)) {
+            numerrs = 1;
+            currangearr_free(iq->selectv_arr);
+            iq->selectv_arr = NULL;
+
+            /* verify error */
+            err.ixnum = -1; /* data */
+            err.errcode = ERR_CONSTR;
+
+            rc = ERR_CONSTR;
+            reqerrstr(iq, COMDB2_CSTRT_RC_INVL_REC, "selectv constraints");
+        } 
     }
 
     /* starting writes, no more reads */
@@ -5107,13 +5153,15 @@ backout:
             int priority = 0;
 
             if (iq->tranddl) {
-                irc = trans_abort(iq, iq->sc_tran);
-                if (irc != 0) {
-                    logmsg(LOGMSG_FATAL, "%s:%d TRANS_ABORT FAILED RC %d",
-                           __func__, __LINE__, irc);
-                    comdb2_die(1);
+                if (iq->sc_tran) {
+                    irc = trans_abort(iq, iq->sc_tran);
+                    if (irc != 0) {
+                        logmsg(LOGMSG_FATAL, "%s:%d TRANS_ABORT FAILED RC %d",
+                               __func__, __LINE__, irc);
+                        comdb2_die(1);
+                    }
+                    iq->sc_tran = NULL;
                 }
-                iq->sc_tran = NULL;
 
                 /* Backout Schema Change */
                 if (!parent_trans)
@@ -5471,9 +5519,11 @@ add_blkseq:
         memcpy(p_buf_fstblk, &t, sizeof(int));
 
         if (!rowlocks) {
-            // if RC_INTERNAL_RETRY && replicant_can_retry don't add to blkseq
-            if (outrc == ERR_BLOCK_FAILED && err.errcode == ERR_VERIFY &&
-                (iq->have_snap_info && iq->snap_info.replicant_can_retry)) {
+            // if VERIFY-ERROR && replicant_is_able_to_retry don't add to blkseq
+            if ((outrc == ERR_NOTSERIAL ||
+                 (outrc == ERR_BLOCK_FAILED && err.errcode == ERR_VERIFY)) &&
+                (iq->have_snap_info &&
+                 iq->snap_info.replicant_is_able_to_retry)) {
                 /* do nothing */
             } else {
                 rc = bdb_blkseq_insert(thedb->bdb_env, parent_trans, bskey,
@@ -5805,13 +5855,7 @@ add_blkseq:
     n_commits++;
     Pthread_mutex_unlock(&commit_stat_lk);
 
-    /* Trigger JAVASP_TRANS_LISTEN_AFTER_COMMIT.  Doesn't really matter what
-     * it does since the transaction is committed. */
     if (outrc == 0) {
-        thrman_wheref(thr_self, "%s [javasp post commit]", req2a(iq->opcode));
-        javasp_trans_misc_trigger(javasp_trans_handle,
-                                  JAVASP_TRANS_LISTEN_AFTER_COMMIT);
-
         if (iq->__limits.maxcost_warn &&
             (iq->cost > iq->__limits.maxcost_warn)) {
             logmsg(LOGMSG_WARN, "[%s] warning: transaction exceeded cost threshold "
@@ -5820,6 +5864,7 @@ add_blkseq:
         }
     }
 
+    fromline = __LINE__;
 cleanup:
     logmsg(LOGMSG_DEBUG, "%s cleanup did_replay:%d fromline:%d\n", __func__,
            did_replay, fromline);
@@ -5863,18 +5908,18 @@ static uint64_t block_processor_ms = 0;
 static int toblock_main(struct javasp_trans_state *javasp_trans_handle,
                         struct ireq *iq, block_state_t *p_blkstate)
 {
-    int now, rc, prcnt = 0, prmax = 0;
-    uint64_t start, end;
-    extern int gbl_print_blockp_stats;
+    int rc, prcnt = 0, prmax = 0;
     static pthread_mutex_t blklk = PTHREAD_MUTEX_INITIALIZER;
-    static int blkcnt = 0, lastpr = 0;
+    static int blkcnt = 0;
+    static uint64_t lastpr = 0;
+
+    uint64_t start = gettimeofday_ms();
 
     Pthread_mutex_lock(&blklk);
     blkcnt++;
-
-    if (((now = comdb2_time_epoch()) - lastpr) > 1) {
+    if (start - lastpr > 1000) {
         prcnt = blkcnt;
-        lastpr = now;
+        lastpr = start;
     }
 
     if (blkcnt > blkmax)
@@ -5885,13 +5930,13 @@ static int toblock_main(struct javasp_trans_state *javasp_trans_handle,
     Pthread_mutex_unlock(&blklk);
 
     if (prcnt && gbl_print_blockp_stats) {
-        logmsg(LOGMSG_USER, "%d threads are in the block processor, max is %d\n",
-                prcnt, prmax);
+        logmsg(LOGMSG_USER,
+               "%d threads are in the block processor, max is %d\n", prcnt,
+               prmax);
     }
 
-    start = gettimeofday_ms();
     rc = toblock_main_int(javasp_trans_handle, iq, p_blkstate);
-    end = gettimeofday_ms();
+    uint64_t end = gettimeofday_ms();
 
     if (rc == 0) {
         osql_postcommit_handle(iq);

@@ -63,7 +63,7 @@ int gbl_sc_last_writer_time = 0;
 pthread_mutex_t gbl_sc_lock = PTHREAD_MUTEX_INITIALIZER;
 int gbl_sc_report_freq = 15; /* seconds between reports */
 int gbl_sc_abort = 0;
-int gbl_sc_resume_start = 0;
+uint32_t gbl_sc_resume_start = 0;
 /* see sc_del_unused_files() and sc_del_unused_files_check_progress() */
 int sc_del_unused_files_start_ms = 0;
 int gbl_sc_del_unused_files_threshold_ms = 30000;
@@ -315,6 +315,9 @@ void reset_sc_stat()
  * change (removing temp tables etc). */
 void live_sc_off(struct dbtable *db)
 {
+#ifdef DEBUG
+    logmsg(LOGMSG_INFO, "live_sc_off()\n");
+#endif
     Pthread_rwlock_wrlock(&db->sc_live_lk);
     db->sc_to = NULL;
     db->sc_from = NULL;
@@ -374,7 +377,7 @@ int reload_lua()
 
 int replicant_reload_analyze_stats()
 {
-    ATOMIC_ADD(gbl_analyze_gen, 1);
+    ATOMIC_ADD32(gbl_analyze_gen, 1);
     logmsg(LOGMSG_DEBUG, "Replicant invalidating SQLite stats\n");
     return 0;
 }

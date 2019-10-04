@@ -377,7 +377,7 @@ int do_alter_table(struct ireq *iq, struct schema_change_type *s,
     struct scinfo scinfo;
 
 #ifdef DEBUG_SC
-    printf("do_alter_table() %s\n", s->resume ? "resuming" : "");
+    logmsg(LOGMSG_INFO, "do_alter_table() %s\n", s->resume ? "resuming" : "");
 #endif
 
     gbl_use_plan = 1;
@@ -418,7 +418,7 @@ int do_alter_table(struct ireq *iq, struct schema_change_type *s,
 
     newdb->iq = iq;
 
-    if (add_cmacc_stmt(newdb, 1) != 0) {
+    if ((add_cmacc_stmt(newdb, 1)) || (init_check_constraints(newdb))) {
         backout(newdb);
         cleanup_newdb(newdb);
         sc_errf(s, "Failed to process schema!\n");
@@ -426,23 +426,17 @@ int do_alter_table(struct ireq *iq, struct schema_change_type *s,
         return -1;
     }
 
-    extern int gbl_partial_indexes;
-    extern int gbl_expressions_indexes;
-    if ((gbl_partial_indexes && newdb->ix_partial) ||
-        (gbl_expressions_indexes && newdb->ix_expr)) {
-        int ret = 0;
-        ret = new_indexes_syntax_check(iq, newdb);
-        if (ret) {
-            Pthread_mutex_unlock(&csc2_subsystem_mtx);
-            sc_errf(s, "New indexes syntax error\n");
-            backout(newdb);
-            cleanup_newdb(newdb);
-            return SC_CSC2_ERROR;
-        } else {
-            sc_printf(s, "New indexes ok\n");
-        }
-        newdb->ix_blob = newdb->schema->ix_blob;
+    if ((rc = sql_syntax_check(iq, newdb))) {
+        Pthread_mutex_unlock(&csc2_subsystem_mtx);
+        sc_errf(s, "Sqlite syntax check failed\n");
+        backout(newdb);
+        cleanup_newdb(newdb);
+        return SC_CSC2_ERROR;
+    } else {
+        sc_printf(s, "Sqlite syntax check succeeded\n");
     }
+    newdb->ix_blob = newdb->schema->ix_blob;
+
     Pthread_mutex_unlock(&csc2_subsystem_mtx);
 
     if ((iq == NULL || iq->tranddl <= 1) &&
@@ -553,7 +547,7 @@ convert_records:
             sleep(5);
         }
         if (gbl_sc_resume_start > 0)
-            ATOMIC_ADD(gbl_sc_resume_start, -1);
+            ATOMIC_ADD32(gbl_sc_resume_start, -1);
     }
     MEMORY_SYNC;
 
@@ -828,7 +822,7 @@ int finalize_alter_table(struct ireq *iq, struct schema_change_type *s,
 
     rc = bdb_close_only_sc(old_bdb_handle, transac, &bdberr);
     if (rc) {
-        sc_errf(s, "Failed closing old db, bdberr\n", bdberr);
+        sc_errf(s, "Failed closing old db, bdberr %d\n", bdberr);
         goto failed;
     }
     sc_printf(s, "Close old db ok\n");
@@ -855,7 +849,7 @@ int finalize_alter_table(struct ireq *iq, struct schema_change_type *s,
             db->tableversion = s->usedbtablevers;
         } else
             db->tableversion = table_version_select(db, transac);
-        sc_printf(s, "Reusing version %d for same schema\n", db->tableversion);
+        sc_printf(s, "Reusing version %llu for same schema\n", db->tableversion);
     }
 
     set_odh_options_tran(db, transac);

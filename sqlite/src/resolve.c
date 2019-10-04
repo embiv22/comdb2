@@ -17,8 +17,10 @@
 #include "sqliteInt.h"
 
 #if defined(SQLITE_BUILDING_FOR_COMDB2)
-int sqlite3IsComdb2Rowid(const char *);
-int sqlite3IsComdb2RowTimestamp(const char *);
+extern int gbl_strict_dbl_quotes;
+int sqlite3IsComdb2Rowid(Table *pTab, const char *);
+int sqlite3IsComdb2RowTimestamp(Table *pTab, const char *);
+int is_comdb2_index_blob(const char *dbname, int icol);
 #endif /* defined(SQLITE_BUILDING_FOR_COMDB2) */
 
 /*
@@ -414,11 +416,11 @@ static int lookupName(
     ** the vm sniffs this out when it runs OP_Rowid and executes the comdb2
     ** backend call to get the rrn+genid.
     */
-    else if( cnt==0 && cntTab==1 && sqlite3IsComdb2Rowid(zCol) ){
+    else if( cnt==0 && cntTab==1 && pMatch && sqlite3IsComdb2Rowid(pMatch->pTab, zCol) ){
        cnt = 1;
        pExpr->iColumn = -2;
        pExpr->affinity = SQLITE_AFF_TEXT;
-    }else if( cnt==0 && cntTab==1 && sqlite3IsComdb2RowTimestamp(zCol) ){
+    }else if( cnt==0 && cntTab==1 && pMatch && sqlite3IsComdb2RowTimestamp(pMatch->pTab, zCol) ){
        cnt = 1;
        pExpr->iColumn = -3;
        pExpr->affinity = SQLITE_AFF_TEXT;
@@ -429,7 +431,6 @@ static int lookupName(
      && pExpr->y.pTab
      && pExpr->iColumn>=0
     ){
-      int is_comdb2_index_blob(const char *dbname, int icol);
       is_comdb2_index_blob(pExpr->y.pTab->zName, pExpr->iColumn);
     }
 #endif /* defined(SQLITE_BUILDING_FOR_COMDB2) */
@@ -514,6 +515,12 @@ static int lookupName(
   if( cnt==0 && zTab==0 ){
     assert( pExpr->op==TK_ID );
     if( ExprHasProperty(pExpr,EP_DblQuoted) ){
+#if defined(SQLITE_BUILDING_FOR_COMDB2)
+      if( gbl_strict_dbl_quotes ){
+        sqlite3ErrorMsg(pParse, "double-quoted string literal: \"%w\"", zCol);
+        return WRC_Abort;
+      }
+#endif /* defined(SQLITE_BUILDING_FOR_COMDB2) */
       /* If a double-quoted identifier does not match any known column name,
       ** then treat it as a string.
       **

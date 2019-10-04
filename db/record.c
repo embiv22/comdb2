@@ -52,6 +52,7 @@
 
 extern int gbl_partial_indexes;
 extern int gbl_expressions_indexes;
+extern int gbl_reorder_idx_writes;
 
 static int check_blob_buffers(struct ireq *iq, blob_buffer_t *blobs,
                               size_t maxblobs, const char *tblname,
@@ -231,7 +232,7 @@ int add_record(struct ireq *iq, void *trans, const uint8_t *p_buf_tag_name,
     if (rc != 0) {
         reqerrstrhdr(iq, "Table '%s' ", iq->usedb->tablename);
         reqerrstr(iq, COMDB2_CSTRT_RC_INVL_TAG,
-                  "invalid tag description '%.*s'", taglen, tagdescr);
+                  "invalid tag description '%.*s'", (int) taglen, tagdescr);
         *opfailcode = OP_FAILED_BAD_REQUEST;
         retrc = ERR_BADREQ;
         ERR;
@@ -281,11 +282,11 @@ int add_record(struct ireq *iq, void *trans, const uint8_t *p_buf_tag_name,
 
         if (mismatched_size) {
             if (iq->debug)
-                reqprintf(iq, "BAD DTA LEN %u TAG %s EXPECTS DTALEN %u\n",
+                reqprintf(iq, "BAD DTA LEN %zu TAG %s EXPECTS DTALEN %u\n",
                           reclen, tag, expected_dat_len);
             reqerrstrhdr(iq, "Table '%s' ", iq->usedb->tablename);
             reqerrstr(iq, COMDB2_ADD_RC_INVL_DTA,
-                      "bad data length %u tag '%s' expects data length %u",
+                      "bad data length %zu tag '%s' expects data length %u",
                       reclen, tag, expected_dat_len);
             *opfailcode = OP_FAILED_BAD_REQUEST;
             retrc = ERR_BADREQ;
@@ -377,6 +378,21 @@ int add_record(struct ireq *iq, void *trans, const uint8_t *p_buf_tag_name,
         ondisktagsc = find_tag_schema(iq->usedb->tablename, ondisktag);
     }
 
+    rc = verify_check_constraints(iq->usedb, od_dta, blobs, maxblobs, 1);
+    if (rc < 0) {
+        reqerrstr(iq, ERR_INTERNAL, "Internal error during CHECK constraint");
+        *opfailcode = ERR_INTERNAL;
+        rc = retrc = ERR_INTERNAL;
+        ERR;
+    } else if (rc > 0) {
+        reqerrstrhdr(iq, "CHECK constraint violation ");
+        reqerrstr(iq, ERR_CHECK_CONSTRAINT, "CHECK constraint failed for '%s'",
+                  iq->usedb->check_constraints[rc - 1].consname);
+        *opfailcode = ERR_CHECK_CONSTRAINT;
+        rc = retrc = ERR_CHECK_CONSTRAINT;
+        ERR;
+    }
+
     rc =
         validate_server_record(iq, od_dta, od_len, tag, ondisktag, ondisktagsc);
     if (rc == -1) {
@@ -423,7 +439,7 @@ int add_record(struct ireq *iq, void *trans, const uint8_t *p_buf_tag_name,
             retrc = dat_add(iq, trans, od_dta, od_len, genid, rrn);
 
         if (iq->debug) {
-            reqprintf(iq, "dat_add RRN %d GENID 0x%llx DTALEN %u RC %d DATA ",
+            reqprintf(iq, "dat_add RRN %d GENID 0x%llx DTALEN %zu RC %d DATA ",
                       *rrn, *genid, od_len, retrc);
             reqdumphex(iq, od_dta, od_len);
         }
@@ -444,7 +460,7 @@ int add_record(struct ireq *iq, void *trans, const uint8_t *p_buf_tag_name,
             retrc = blob_add(iq, trans, blobno, blob->data, blob->length, *rrn,
                              *genid, IS_ODH_READY(blob));
             if (iq->debug) {
-                reqprintf(iq, "blob_add LEN %u RC %d DATA ", blob->length,
+                reqprintf(iq, "blob_add LEN %zu RC %d DATA ", blob->length,
                           retrc);
                 reqdumphex(iq, blob->data, blob->length);
             }
@@ -465,42 +481,55 @@ int add_record(struct ireq *iq, void *trans, const uint8_t *p_buf_tag_name,
         }
     }
 
-    /*
-     * Form and add all the keys.
-     * If there are constraints, do the add to indices deferred.
-     *
-     * For records from INSERT ... ON CONFLICT DO NOTHING, we need
-     * to update the indices inplace to avoid inserting duplicate
-     * data. The keys, however, are also added to the deferred
-     * temporary table to enable cascading updates, if needed.
-     */
-    if (has_constraint(flags)) /* if NOT no constraints */
-    {
-        if (!is_event_from_sc(flags)) {
-            /* enqueue the add of the key for constaint checking purposes */
-            rc = insert_add_op(iq, opcode, *rrn, -1, *genid, ins_keys, blkpos,
-                               rec_flags);
-            if (rc != 0) {
-                if (iq->debug)
-                    reqprintf(iq, "FAILED TO PUSH KEYOP");
-                *opfailcode = OP_FAILED_INTERNAL;
-                retrc = ERR_INTERNAL;
-                ERR;
-            }
-        } else {
-            /* if rec adding to NEW SCHEMA and this has constraints,
-             * handle idx in live_sc_*
-             */
-        }
-    }
+    if (iq->usedb->nix > 0) {
+        bool reorder =
+            gbl_reorder_idx_writes && !is_event_from_sc(flags) &&
+            rec_flags == 0 && (flags & RECFLAGS_DONT_REORDER_IDX) == 0 &&
+            iq->usedb->sc_from != iq->usedb &&
+            strcasecmp(iq->usedb->tablename, "comdb2_oplog") != 0 &&
+            strcasecmp(iq->usedb->tablename, "comdb2_commit_log") != 0 &&
+            strncasecmp(iq->usedb->tablename, "sqlite_stat", 11) != 0;
 
-    if (!has_constraint(flags) || (rec_flags & OSQL_IGNORE_FAILURE)) {
-        retrc =
-            add_record_indices(iq, trans, blobs, maxblobs, opfailcode,
-                               ixfailnum, rrn, genid, vgenid, ins_keys, opcode,
-                               blkpos, od_dta, od_len, ondisktag, ondisktagsc);
-        if (retrc)
-            ERR;
+        if (reorder)
+            rec_flags |= OSQL_ITEM_REORDERED;
+
+        /* Form and add all the keys.
+         * If there are constraints, do the add to indices deferred.
+         *
+         * For records from INSERT ... ON CONFLICT DO NOTHING, we need
+         * to update the indices inplace to avoid inserting duplicate
+         * data. The keys, however, are also added to the deferred
+         * temporary table to enable cascading updates, if needed.
+         */
+
+        if (has_constraint(flags)) { /* if NOT no constraints */
+            if (!is_event_from_sc(flags)) {
+                /* enqueue the add of the key for constraint checking purpose */
+                rc = insert_add_op(iq, opcode, *rrn, -1, *genid, ins_keys,
+                                   blkpos, rec_flags);
+                if (rc != 0) {
+                    if (iq->debug)
+                        reqprintf(iq, "FAILED TO PUSH KEYOP");
+                    *opfailcode = OP_FAILED_INTERNAL;
+                    retrc = ERR_INTERNAL;
+                    ERR;
+                }
+            } else {
+                /* if rec adding to NEW SCHEMA and this has constraints,
+                 * handle idx in live_sc_*
+                 */
+            }
+        }
+
+        if (!has_constraint(flags) || (rec_flags & OSQL_IGNORE_FAILURE) ||
+            reorder) {
+            retrc = add_record_indices(iq, trans, blobs, maxblobs, opfailcode,
+                                       ixfailnum, rrn, genid, vgenid, ins_keys,
+                                       opcode, blkpos, od_dta, od_len,
+                                       ondisktag, ondisktagsc, flags, reorder);
+            if (retrc)
+                ERR;
+        }
     }
 
     /*
@@ -686,8 +715,8 @@ int upd_record(struct ireq *iq, void *trans, void *primkey, int rrn,
 
     if (p_buf_vrec && (p_buf_vrec_end - p_buf_vrec) != reclen) {
         if (iq->debug)
-            reqprintf(iq, "REC LEN %u DOES NOT EQUAL VREC LEN %u", reclen,
-                      p_buf_vrec_end - p_buf_vrec);
+            reqprintf(iq, "REC LEN %zu DOES NOT EQUAL VREC LEN %td", reclen,
+                      (p_buf_vrec_end - p_buf_vrec));
         retrc = ERR_BADREQ;
         goto err;
     }
@@ -800,10 +829,10 @@ int upd_record(struct ireq *iq, void *trans, void *primkey, int rrn,
 
         if (mismatched_size) {
             if (iq->debug)
-                reqprintf(iq, "BAD DTA LEN %u TAG %s EXPECTS DTALEN %u\n",
+                reqprintf(iq, "BAD DTA LEN %zu TAG %s EXPECTS DTALEN %u\n",
                           reclen, tag, expected_dat_len);
             reqerrstr(iq, COMDB2_UPD_RC_INVL_DTA,
-                      "bad data length %u tag '%s' expects data length %u",
+                      "bad data length %zu tag '%s' expects data length %u",
                       reclen, tag, expected_dat_len);
             *opfailcode = OP_FAILED_BAD_REQUEST;
             retrc = ERR_BADREQ;
@@ -904,7 +933,7 @@ int upd_record(struct ireq *iq, void *trans, void *primkey, int rrn,
                                      &vgenid, old_dta, &fndlen, od_len, trans);
         if (iq->debug) {
             reqprintf(iq, "ix_find_by_primkey_tran RRN %d FND RRN %d "
-                          "GENID 0x%llx DTALEN %u FNDLEN %u PRIMKEY ",
+                          "GENID 0x%llx DTALEN %zu FNDLEN %u PRIMKEY ",
                       rrn, fndrrn, vgenid, od_len, fndlen);
             reqdumphex(iq, primkey, primkeysz);
             reqmoref(iq, " RC %d", rc);
@@ -929,7 +958,7 @@ int upd_record(struct ireq *iq, void *trans, void *primkey, int rrn,
             if (iq->debug)
                 reqprintf(
                     iq, "ix_find_ver_by_rrn_and_genid_tran RRN %d GENID 0x%llx "
-                        "DTALEN %u FNDLEN %u VER %d RC %d",
+                        "DTALEN %zu FNDLEN %u VER %d RC %d",
                     rrn, vgenid, od_len, fndlen, ver, rc);
 
             if (rc == 0 && ver == iq->usedb->schema_version) {
@@ -943,22 +972,27 @@ int upd_record(struct ireq *iq, void *trans, void *primkey, int rrn,
         // other instead of relatively expensive memcpy()
         od_dta = old_dta;
     } else {
-        rc = ix_find_by_rrn_and_genid_tran(iq, rrn, vgenid, old_dta, &fndlen,
+        // To avoid deadlock, get this read done under a write lock
+        rc = ix_load_for_write_by_genid_tran(iq, rrn, vgenid, old_dta, &fndlen,
                                            od_len, trans);
         if (iq->debug)
-            reqprintf(iq, "ix_find_by_rrn_and_genid_tran RRN %d GENID 0x%llx "
-                          "DTALEN %u FNDLEN %u RC %d",
+            reqprintf(iq, "ix_load_for_write_by_genid_tran RRN %d GENID 0x%llx "
+                          "DTALEN %zu FNDLEN %d RC %d",
                       rrn, vgenid, od_len, fndlen, rc);
     }
     if (rc != 0 || od_len != fndlen) {
         if (iq->debug)
-            reqprintf(iq, "FIND OLD RECORD FAILED od_len %u fndlen %u RC %d",
+            reqprintf(iq, "FIND OLD RECORD FAILED od_len %zu fndlen %u RC %d",
                       od_len, fndlen, rc);
         reqerrstr(iq, COMDB2_UPD_RC_UNKN_REC, "find old record failed");
         *opfailcode = OP_FAILED_VERIFY;
-        if (rc == RC_INTERNAL_RETRY)
+        if (rc == RC_INTERNAL_RETRY) {
+            logmsg(LOGMSG_DEBUG,
+                   "%s line %d find old record failed with "
+                   "internal_retry\n",
+                   __func__, __LINE__);
             retrc = rc;
-        else
+        } else
             retrc = ERR_VERIFY;
         goto err;
     }
@@ -1123,6 +1157,21 @@ int upd_record(struct ireq *iq, void *trans, void *primkey, int rrn,
         }
         del_idx_blobs = del_blobs_buf;
         add_idx_blobs = add_blobs_buf;
+    }
+
+    rc = verify_check_constraints(iq->usedb, od_dta, blobs, maxblobs, 0);
+    if (rc < 0) {
+        reqerrstr(iq, ERR_INTERNAL, "Internal error during CHECK constraint");
+        *opfailcode = ERR_INTERNAL;
+        rc = retrc = ERR_INTERNAL;
+        ERR;
+    } else if (rc > 0) {
+        reqerrstrhdr(iq, "CHECK constraint violation ");
+        reqerrstr(iq, ERR_CHECK_CONSTRAINT, "CHECK constraint failed for '%s'",
+                  iq->usedb->check_constraints[rc - 1].consname);
+        *opfailcode = ERR_CHECK_CONSTRAINT;
+        rc = retrc = ERR_CHECK_CONSTRAINT;
+        ERR;
     }
 
     if (has_constraint(flags)) {
@@ -1571,7 +1620,7 @@ int del_record(struct ireq *iq, void *trans, void *primkey, int rrn,
                                      &fndlen, od_len, trans);
         if (iq->debug)
             reqprintf(iq, "ix_find_by_primkey_tran RRN %d FND RRN %d "
-                          "GENID 0x%llx DTALEN %u FNDLEN %u RC %d",
+                          "GENID 0x%llx DTALEN %zu FNDLEN %u RC %d",
                       rrn, fndrrn, fndgenid, od_len, fndlen, rc);
         if (rc == 0 && rrn != fndrrn) {
             *opfailcode = OP_FAILED_VERIFY;
@@ -1580,18 +1629,18 @@ int del_record(struct ireq *iq, void *trans, void *primkey, int rrn,
         }
         genid = fndgenid;
     } else {
-        rc = ix_find_by_rrn_and_genid_tran(iq, rrn, genid, od_dta, &fndlen,
+        rc = ix_load_for_write_by_genid_tran(iq, rrn, genid, od_dta, &fndlen,
                                            od_len, trans);
         if (iq->debug)
-            reqprintf(iq, "ix_find_by_rrn_and_genid_tran RRN %d GENID 0x%llx "
-                          "DTALEN %u FNDLEN %u RC %d",
+            reqprintf(iq, "ix_load_for_write_by_genid_tran RRN %d GENID 0x%llx "
+                          "DTALEN %zu FNDLEN %u RC %d",
                       rrn, genid, od_len, fndlen, rc);
     }
 
     /* Must handle deadlock correctly */
     if (rc != 0 || od_len != fndlen) {
         if (iq->debug)
-            reqprintf(iq, "FIND OLD RECORD FAILED od_len %u fndlen %u RC %d",
+            reqprintf(iq, "FIND OLD RECORD FAILED od_len %zu fndlen %u RC %d",
                       od_len, fndlen, rc);
         reqerrstrhdr(iq, "Table '%s' ", iq->usedb->tablename);
         reqerrstr(iq, COMDB2_DEL_RC_UNKN_REC, "find old record failed");
@@ -1687,7 +1736,7 @@ int del_record(struct ireq *iq, void *trans, void *primkey, int rrn,
     const char *tag = is_event_from_sc(flags) ? ".NEW..ONDISK" : ".ONDISK";
     /* Form and delete all keys. */
     retrc = del_record_indices(iq, trans, opfailcode, ixfailnum, rrn, genid,
-                               od_dta, del_keys, del_idx_blobs, tag);
+                               od_dta, del_keys, flags, del_idx_blobs, tag);
     if (retrc)
         ERR;
 
@@ -2020,7 +2069,7 @@ int upd_new_record(struct ireq *iq, void *trans, unsigned long long oldgenid,
             /* delete */
             rc = blob_del(iq, trans, 2, oldgenid, blobn);
             if (iq->debug) {
-                reqprintf(iq, "blob_del genid 0x%llx rc %d", blobn, rc);
+                reqprintf(iq, "blob_del genid 0x%llx blob %d rc %d", oldgenid, blobn, rc);
             }
 
             if (rc != IX_NOTFND && rc != 0) /* like in upd_record() */
@@ -2368,7 +2417,7 @@ static int check_blob_sizes(struct ireq *iq, blob_buffer_t *blobs, int maxblobs)
         if (blobs[i].exists && blobs[i].length != -2 &&
             blobs[i].length > MAXBLOBLENGTH) {
             reqerrstr(iq, COMDB2_ADD_RC_INVL_BLOB,
-                      "blob size (%d) exceeds maximum (%d)", blobs[i].length,
+                      "blob size (%zu) exceeds maximum (%d)", blobs[i].length,
                       MAXBLOBLENGTH);
             return ERR_BLOB_TOO_LARGE;
         }
@@ -2497,7 +2546,7 @@ int updbykey_record(struct ireq *iq, void *trans, const uint8_t *p_buf_tag_name,
     if (rc != 0) {
         reqerrstrhdr(iq, "Table '%s' ", iq->usedb->tablename);
         reqerrstr(iq, COMDB2_CSTRT_RC_INVL_TAG,
-                  "invalid tag description '%.*s'", taglen, tagdescr);
+                  "invalid tag description '%.*s'", (int) taglen, tagdescr);
         *opfailcode = OP_FAILED_BAD_REQUEST;
         retrc = ERR_BADREQ;
         ERR;
@@ -2534,11 +2583,11 @@ int updbykey_record(struct ireq *iq, void *trans, const uint8_t *p_buf_tag_name,
     expected_dat_len = get_size_of_schema(dbname_schema);
     if ((size_t)expected_dat_len > reclen) {
         if (iq->debug)
-            reqprintf(iq, "BAD DTA LEN %u TAG %s EXPECTS DTALEN %u\n", reclen,
+            reqprintf(iq, "BAD DTA LEN %zu TAG %s EXPECTS DTALEN %u\n", reclen,
                       tag, expected_dat_len);
         reqerrstrhdr(iq, "Table '%s' ", iq->usedb->tablename);
         reqerrstr(iq, COMDB2_ADD_RC_INVL_DTA,
-                  "bad data length %u tag '%s' expects data length %u\n",
+                  "bad data length %zu tag '%s' expects data length %u\n",
                   reclen, tag, expected_dat_len);
         *opfailcode = OP_FAILED_BAD_REQUEST;
         retrc = ERR_BADREQ;
@@ -2735,7 +2784,7 @@ done:
     free(stuff);
 }
 
-int odhfy_blob_buffer(struct dbtable *db, blob_buffer_t *blob, int blobind)
+int odhfy_blob_buffer(const dbtable *db, blob_buffer_t *blob, int blobind)
 {
     void *out;
     size_t len;
@@ -2770,7 +2819,7 @@ int odhfy_blob_buffer(struct dbtable *db, blob_buffer_t *blob, int blobind)
     return 0;
 }
 
-int unodhfy_blob_buffer(struct dbtable *db, blob_buffer_t *blob, int blobind)
+int unodhfy_blob_buffer(const dbtable *db, blob_buffer_t *blob, int blobind)
 {
     int rc;
     void *out;
