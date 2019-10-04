@@ -245,7 +245,6 @@ static int systblFieldsFilter(
     systblFieldsNext(pVtabCursor);
   }
 
-
   return SQLITE_OK;
 }
 
@@ -285,6 +284,7 @@ const sqlite3_module systblFieldsModule = {
   0,                         /* xRelease */
   0,                         /* xRollbackTo */
   0,                         /* xShadowName */
+  .access_flag = CDB2_ALLOW_ALL,
 };
 
 #endif /* (!defined(SQLITE_CORE) || defined(SQLITE_BUILDING_FOR_COMDB2)) \

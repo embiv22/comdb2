@@ -377,7 +377,7 @@ int do_alter_table(struct ireq *iq, struct schema_change_type *s,
     struct scinfo scinfo;
 
 #ifdef DEBUG_SC
-    printf("do_alter_table() %s\n", s->resume ? "resuming" : "");
+    logmsg(LOGMSG_INFO, "do_alter_table() %s\n", s->resume ? "resuming" : "");
 #endif
 
     gbl_use_plan = 1;
@@ -387,6 +387,12 @@ int do_alter_table(struct ireq *iq, struct schema_change_type *s,
     if (db == NULL) {
         sc_errf(s, "Table not found:%s\n", s->tablename);
         return SC_TABLE_DOESNOT_EXIST;
+    }
+
+    if (s->resume == SC_PREEMPT_RESUME) {
+        newdb = db->sc_to;
+        changed = s->schema_change;
+        goto convert_records;
     }
 
     set_schemachange_options_tran(s, db, &scinfo, tran);
@@ -412,7 +418,7 @@ int do_alter_table(struct ireq *iq, struct schema_change_type *s,
 
     newdb->iq = iq;
 
-    if (add_cmacc_stmt(newdb, 1) != 0) {
+    if ((add_cmacc_stmt(newdb, 1)) || (init_check_constraints(newdb))) {
         backout(newdb);
         cleanup_newdb(newdb);
         sc_errf(s, "Failed to process schema!\n");
@@ -420,23 +426,17 @@ int do_alter_table(struct ireq *iq, struct schema_change_type *s,
         return -1;
     }
 
-    extern int gbl_partial_indexes;
-    extern int gbl_expressions_indexes;
-    if ((gbl_partial_indexes && newdb->ix_partial) ||
-        (gbl_expressions_indexes && newdb->ix_expr)) {
-        int ret = 0;
-        ret = new_indexes_syntax_check(iq, newdb);
-        if (ret) {
-            Pthread_mutex_unlock(&csc2_subsystem_mtx);
-            sc_errf(s, "New indexes syntax error\n");
-            backout(newdb);
-            cleanup_newdb(newdb);
-            return SC_CSC2_ERROR;
-        } else {
-            sc_printf(s, "New indexes ok\n");
-        }
-        newdb->ix_blob = newdb->schema->ix_blob;
+    if ((rc = sql_syntax_check(iq, newdb))) {
+        Pthread_mutex_unlock(&csc2_subsystem_mtx);
+        sc_errf(s, "Sqlite syntax check failed\n");
+        backout(newdb);
+        cleanup_newdb(newdb);
+        return SC_CSC2_ERROR;
+    } else {
+        sc_printf(s, "Sqlite syntax check succeeded\n");
     }
+    newdb->ix_blob = newdb->schema->ix_blob;
+
     Pthread_mutex_unlock(&csc2_subsystem_mtx);
 
     if ((iq == NULL || iq->tranddl <= 1) &&
@@ -533,7 +533,13 @@ int do_alter_table(struct ireq *iq, struct schema_change_type *s,
     db->sc_to = s->newdb = newdb;
     db->sc_abort = 0;
     db->sc_downgrading = 0;
+    db->doing_conversion = 1; /* live_sc_off will unset it */
     Pthread_rwlock_unlock(&db->sc_live_lk);
+
+convert_records:
+    assert(db->sc_from == db && s->db == db);
+    assert(db->sc_to == newdb && s->newdb == newdb);
+    assert(db->doing_conversion == 1);
     if (s->resume && s->alteronly && !s->finalize_only) {
         if (gbl_test_sc_resume_race && !stopsc) {
             logmsg(LOGMSG_INFO, "%s:%d sleeping 5s for sc_resume test\n",
@@ -541,10 +547,16 @@ int do_alter_table(struct ireq *iq, struct schema_change_type *s,
             sleep(5);
         }
         if (gbl_sc_resume_start > 0)
-            ATOMIC_ADD(gbl_sc_resume_start, -1);
+            ATOMIC_ADD32(gbl_sc_resume_start, -1);
     }
     MEMORY_SYNC;
 
+    /* give a chance for sc to stop */
+    if (stopsc) {
+        sc_errf(s, "master downgrading\n");
+        change_schemas_recover(s->tablename);
+        return SC_MASTER_DOWNGRADE;
+    }
     reset_sc_stat();
     rc = wait_to_resume(s);
     if (rc || stopsc) {
@@ -552,20 +564,37 @@ int do_alter_table(struct ireq *iq, struct schema_change_type *s,
         return SC_MASTER_DOWNGRADE;
     }
 
+    int prev_preempted = s->preempted;
+
+    if (s->preempted == SC_ACTION_PAUSE) {
+        sc_errf(s, "SCHEMACHANGE PAUSED\n");
+        add_ongoing_alter(s);
+        return SC_PAUSED;
+    } else if (s->preempted == SC_ACTION_ABORT) {
+        sc_errf(s, "SCHEMACHANGE ABORTED\n");
+        rc = SC_ABORTED;
+        goto errout;
+    }
+
+    add_ongoing_alter(s);
+
     /* skip converting records for fastinit and planned schema change
      * that doesn't require rebuilding anything. */
     if ((!newdb->plan || newdb->plan->plan_convert) ||
         changed == SC_CONSTRAINT_CHANGE) {
-        db->doing_conversion = 1;
         if (!s->live)
             gbl_readonly_sc = 1;
         rc = convert_all_records(db, newdb, newdb->sc_genids, s);
         if (rc == 1) rc = 0;
-        db->doing_conversion = 0;
     } else
         rc = 0;
 
-    if (stopsc || rc == SC_MASTER_DOWNGRADE)
+    remove_ongoing_alter(s);
+
+    if (s->preempted != prev_preempted || rc == SC_PREEMPTED) {
+        sc_errf(s, "SCHEMACHANGE PREEMPTED\n");
+        return SC_PREEMPTED;
+    } else if (stopsc || rc == SC_MASTER_DOWNGRADE)
         rc = SC_MASTER_DOWNGRADE;
     else if (rc)
         rc = SC_CONVERSION_FAILED;
@@ -585,10 +614,12 @@ int do_alter_table(struct ireq *iq, struct schema_change_type *s,
         sc_printf(s, "[%s] ...slept for %d\n", db->tablename, s->convert_sleep);
     }
 
+errout:
     if (rc && rc != SC_MASTER_DOWNGRADE) {
         /* For live schema change, MUST do this before trying to remove
          * the .new tables or you get crashes */
-        if (gbl_sc_abort || db->sc_abort || iq->sc_should_abort) {
+        if (gbl_sc_abort || db->sc_abort || iq->sc_should_abort ||
+            rc == SC_ABORTED) {
             sc_errf(s, "convert_all_records aborted\n");
         } else {
             sc_errf(s, "convert_all_records failed\n");
@@ -733,10 +764,6 @@ int finalize_alter_table(struct ireq *iq, struct schema_change_type *s,
         goto backout;
     }
 
-    if ((rc = mark_schemachange_over_tran(db->tablename, transac))) {
-        goto backout;
-    }
-
     s->already_finalized = 1;
 
     /* remove the new.NUM. prefix */
@@ -795,7 +822,7 @@ int finalize_alter_table(struct ireq *iq, struct schema_change_type *s,
 
     rc = bdb_close_only_sc(old_bdb_handle, transac, &bdberr);
     if (rc) {
-        sc_errf(s, "Failed closing old db, bdberr\n", bdberr);
+        sc_errf(s, "Failed closing old db, bdberr %d\n", bdberr);
         goto failed;
     }
     sc_printf(s, "Close old db ok\n");
@@ -822,7 +849,7 @@ int finalize_alter_table(struct ireq *iq, struct schema_change_type *s,
             db->tableversion = s->usedbtablevers;
         } else
             db->tableversion = table_version_select(db, transac);
-        sc_printf(s, "Reusing version %d for same schema\n", db->tableversion);
+        sc_printf(s, "Reusing version %llu for same schema\n", db->tableversion);
     }
 
     set_odh_options_tran(db, transac);

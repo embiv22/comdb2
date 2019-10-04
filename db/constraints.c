@@ -30,11 +30,9 @@
 #include <assert.h>
 #include "logmsg.h"
 #include "views.h"
+#include "indices.h"
 #include "osqlsqlthr.h"
 
-static void *get_constraint_table_cursor(void *table);
-
-static int close_constraint_table_cursor(void *cursor);
 
 static char *get_temp_ct_dbname(long long *);
 static int is_update_op(int op);
@@ -68,6 +66,7 @@ int has_cascading_reverse_constraints(struct dbtable *db)
     return 0;
 }
 
+/* this is for index on expressions */
 static int insert_add_index(struct ireq *iq, unsigned long long genid)
 {
     char key[MAXKEYLEN];
@@ -197,10 +196,44 @@ static inline void free_cached_delayed_indexes(struct ireq *iq)
     }
 }
 
-int insert_add_op(struct ireq *iq, const uint8_t *p_buf_req_start,
-                  const uint8_t *p_buf_req_end, int optype, int rrn, int ixnum,
+enum ct_etype { CTE_ADD = 1, CTE_DEL, CTE_UPD };
+
+struct forward_ct {
+    unsigned long long genid;
+    unsigned long long ins_keys;
+    struct dbtable *usedb;
+    int blkpos;
+    int ixnum;
+    int rrn;
+    int optype;
+    int flags;
+};
+
+struct backward_ct {
+    struct dbtable *srcdb;
+    struct dbtable *dstdb;
+    int blkpos;
+    int optype;
+    char key[MAXKEYLEN];
+    char newkey[MAXKEYLEN];
+    int sixlen;
+    int sixnum;
+    int dixnum;
+    int nonewrefs;
+    int flags;
+};
+
+typedef struct cttbl_entry {
+    int ct_type;
+    union {
+        struct forward_ct fwdct;
+        struct backward_ct bwdct;
+    } ctop;
+} cte;
+
+int insert_add_op(struct ireq *iq, int optype, int rrn, int ixnum,
                   unsigned long long genid, unsigned long long ins_keys,
-                  int blkpos, int flags)
+                  int blkpos, int rec_flags)
 {
     block_state_t *blkstate = iq->blkstate;
     int type = CTE_ADD, rc = 0;
@@ -223,20 +256,20 @@ int insert_add_op(struct ireq *iq, const uint8_t *p_buf_req_start,
     memcpy(key + sizeof(type), &blkstate->ct_id_key,
            sizeof(blkstate->ct_id_key));
     cte_record.ct_type = CTE_ADD;
-    cte_record.ctop.fwdct.genid = genid;
-    cte_record.ctop.fwdct.ins_keys = ins_keys;
-    cte_record.ctop.fwdct.p_buf_req_start = p_buf_req_start;
-    cte_record.ctop.fwdct.p_buf_req_end = p_buf_req_end;
-    cte_record.ctop.fwdct.usedb = iq->usedb;
-    cte_record.ctop.fwdct.blkpos = blkpos;
-    cte_record.ctop.fwdct.ixnum = ixnum;
-    cte_record.ctop.fwdct.rrn = rrn;
-    cte_record.ctop.fwdct.optype = optype;
-    cte_record.ctop.fwdct.flags = flags;
+    struct forward_ct *fwdct = &cte_record.ctop.fwdct;
+    fwdct->genid = genid;
+    fwdct->ins_keys = ins_keys;
+    fwdct->usedb = iq->usedb;
+    fwdct->blkpos = blkpos;
+    fwdct->ixnum = ixnum;
+    fwdct->rrn = rrn;
+    fwdct->optype = optype;
+    fwdct->flags = rec_flags;
 
     rc = bdb_temp_table_insert(thedb->bdb_env, cur, key,
                                sizeof(int) + sizeof(long long), &cte_record,
                                sizeof(cte), &err);
+
     close_constraint_table_cursor(cur);
     if (rc != 0) {
         logmsg(LOGMSG_ERROR, "insert_add_op: bdb_temp_table_insert rc = %d\n", rc);
@@ -247,13 +280,15 @@ int insert_add_op(struct ireq *iq, const uint8_t *p_buf_req_start,
         logmsg(LOGMSG_ERROR, "insert_add_op: insert_add_index rc = %d\n", rc);
         return -1;
     }
+
     blkstate->ct_id_key++;
     return 0;
 }
 
-int insert_del_op(block_state_t *blkstate, struct dbtable *srcdb, struct dbtable *dstdb,
-                  int optype, int blkpos, void *inkey, void *innewkey,
-                  int keylen, int sixnum, int dixnum, int nonewrefs, int flags)
+static int insert_del_op(block_state_t *blkstate, struct dbtable *srcdb,
+                         struct dbtable *dstdb, int optype, int blkpos,
+                         void *inkey, void *innewkey, int keylen, int sixnum,
+                         int dixnum, int nonewrefs, int flags)
 {
     void *cur = NULL;
     int type = CTE_DEL, rc = 0;
@@ -273,22 +308,22 @@ int insert_del_op(block_state_t *blkstate, struct dbtable *srcdb, struct dbtable
     memcpy(key + sizeof(type), &blkstate->ct_id_key,
            sizeof(blkstate->ct_id_key));
     cte_record.ct_type = CTE_DEL;
-    cte_record.ctop.bwdct.srcdb = srcdb;
-    cte_record.ctop.bwdct.dstdb = dstdb;
-    cte_record.ctop.bwdct.blkpos = blkpos;
-    cte_record.ctop.bwdct.sixlen = keylen;
-    cte_record.ctop.bwdct.sixnum = sixnum;
-    cte_record.ctop.bwdct.dixnum = dixnum;
-    cte_record.ctop.bwdct.optype = optype;
-    cte_record.ctop.bwdct.nonewrefs = nonewrefs;
-    cte_record.ctop.bwdct.flags = flags;
-    memcpy(cte_record.ctop.bwdct.key, inkey, keylen);
+    struct backward_ct *bwdct = &cte_record.ctop.bwdct;
+    bwdct->srcdb = srcdb;
+    bwdct->dstdb = dstdb;
+    bwdct->blkpos = blkpos;
+    bwdct->sixlen = keylen;
+    bwdct->sixnum = sixnum;
+    bwdct->dixnum = dixnum;
+    bwdct->optype = optype;
+    bwdct->nonewrefs = nonewrefs;
+    bwdct->flags = flags;
+    memcpy(bwdct->key, inkey, keylen);
     if (innewkey == NULL) {
-        memset(cte_record.ctop.bwdct.newkey, 0,
-               sizeof(cte_record.ctop.bwdct.newkey));
+        memset(bwdct->newkey, 0, sizeof(bwdct->newkey));
     } else {
         /* always non-null in case of updates */
-        memcpy(cte_record.ctop.bwdct.newkey, innewkey, keylen);
+        memcpy(bwdct->newkey, innewkey, keylen);
     }
 
     rc = bdb_temp_table_insert(thedb->bdb_env, cur, key,
@@ -323,7 +358,6 @@ int check_update_constraints(struct ireq *iq, void *trans,
                              void *newrec_dta, unsigned long long del_keys,
                              int *errout)
 {
-
     int i = 0, rc = 0;
     for (i = 0; i < iq->usedb->n_rev_constraints; i++) {
         int j = 0;
@@ -551,18 +585,12 @@ int check_update_constraints(struct ireq *iq, void *trans,
 
 /* FOR UPDATES/DELETES, MUST VERIFY AGAINST DELETED RECORD'S TABLE TO SEE IF
  * THERE'RE ANY  KEYS WITH SAME VALUE.  IT IS OK TO DELETE IF THATS THE CASE */
-int verify_del_constraints(struct javasp_trans_state *javasp_trans_handle,
-                           struct ireq *iq, block_state_t *blkstate,
+int verify_del_constraints(struct ireq *iq, block_state_t *blkstate,
                            void *trans, blob_buffer_t *blobs, int *errout)
 {
     int rc = 0, fndrrn = 0, err = 0;
-    int cascade;
-    int del_cascade;
     int keylen;
-    int upd_cascade;
     char key[MAXKEYLEN];
-    unsigned char nulls[MAXNULLBITS] = {0};
-    void *cur = NULL;
 
     struct thread_info *thdinfo = pthread_getspecific(unique_tag_key);
     if (thdinfo == NULL) {
@@ -573,7 +601,8 @@ int verify_del_constraints(struct javasp_trans_state *javasp_trans_handle,
         *errout = OP_FAILED_INTERNAL;
         return ERR_INTERNAL;
     }
-    cur = get_constraint_table_cursor(thdinfo->ct_del_table);
+
+    void *cur = get_constraint_table_cursor(thdinfo->ct_del_table);
     if (cur == NULL) {
         if (iq->debug)
             reqprintf(iq, "VERKYCNSTRT CANNOT GET DEL LIST CURSOR");
@@ -599,15 +628,9 @@ int verify_del_constraints(struct javasp_trans_state *javasp_trans_handle,
         *errout = OP_FAILED_INTERNAL;
         return ERR_INTERNAL;
     }
+
     while (rc == 0) {
         cte *ctrq = (cte *)bdb_temp_table_data(cur);
-        struct backward_ct *bct = NULL;
-        unsigned long long genid = 0LL, fndgenid = 0LL;
-        struct dbtable *currdb = NULL;
-        char *skey = NULL;
-        int rrn = 0;
-
-        /* do something */
         if (ctrq == NULL) {
             if (iq->debug)
                 reqprintf(iq, "VERKYCNSTRT CANNOT GET DEL LIST RECORD DATA");
@@ -617,21 +640,19 @@ int verify_del_constraints(struct javasp_trans_state *javasp_trans_handle,
             close_constraint_table_cursor(cur);
             return ERR_INTERNAL;
         }
-        bct = &ctrq->ctop.bwdct;
-        currdb = iq->usedb;
 
-        skey = bct->key;
-        if (skey == NULL)
-            skey = "";
+        unsigned long long genid = 0LL, fndgenid = 0LL;
+        int rrn = 0;
+        int del_cascade = 0;
+        int upd_cascade = 0;
+        struct backward_ct *bct = &ctrq->ctop.bwdct;
+        struct dbtable *currdb = iq->usedb; /* make a copy */
+        char *skey = bct ? bct->key : "";
 
-        if (is_delete_op(bct->optype) &&
-            ((bct->flags & CT_DEL_CASCADE) == CT_DEL_CASCADE))
-            upd_cascade = !(cascade = del_cascade = 1);
-        else if (is_update_op(bct->optype) &&
-                 ((bct->flags & CT_UPD_CASCADE) == CT_UPD_CASCADE))
-            del_cascade = !(cascade = upd_cascade = 1);
-        else
-            cascade = del_cascade = upd_cascade = 0;
+        if (is_delete_op(bct->optype) && (bct->flags & CT_DEL_CASCADE))
+            del_cascade = 1;
+        else if (is_update_op(bct->optype) && (bct->flags & CT_UPD_CASCADE))
+            upd_cascade = 1;
 
         /* verify against source table...must be not found */
         iq->usedb = bct->srcdb;
@@ -647,6 +668,7 @@ int verify_del_constraints(struct javasp_trans_state *javasp_trans_handle,
         }
 
         if (rc != IX_FND && rc != IX_FNDMORE) {
+            // key was not found on source table, so nothing to do
             if (iq->debug) {
                 reqprintf(
                     iq,
@@ -658,244 +680,232 @@ int verify_del_constraints(struct javasp_trans_state *javasp_trans_handle,
             }
             rc = bdb_temp_table_next(thedb->bdb_env, cur, &err);
             continue;
-        } else /*if (rc==IX_FND || rc == IX_FNDMORE)*/
-        {
-            /* check the dependee of the constraint.  if we find another key
-               with the same value, then we're ok. assuming key length and key
-               are
-               exactly the same. */
-            char ondisk_tag[MAXTAGLEN], dondisk_tag[MAXTAGLEN];
-            char dkey[MAXKEYLEN];
-            if (bct->nonewrefs) {
-                if (iq->debug)
-                    reqprintf(iq, "VERBKYCNSTRT CANT FORM NEW DATA TBL %s "
-                                  "INDEX %d FROM %s INDEX %d ",
-                              bct->dstdb->tablename, bct->dixnum,
-                              bct->srcdb->tablename, bct->sixnum);
-                reqmoref(iq, " RC %d", rc);
-                reqerrstr(iq, COMDB2_CSTRT_RC_INVL_DTA,
-                          "verify key constraint cannot form new data table "
-                          "'%s' index %d from %s index %d ",
+        }
+
+        /* Key was found, check the dependee (parent table) of the constraint.
+         * If we find another key there with the same value, then we dont need
+         * to do anything (if also key length and key are exactly the same).
+         * If we dont find key, we need to cascade the delete. */
+        char ondisk_tag[MAXTAGLEN], dondisk_tag[MAXTAGLEN];
+        char dkey[MAXKEYLEN];
+        if (bct->nonewrefs) {
+            if (iq->debug)
+                reqprintf(iq,
+                          "VERBKYCNSTRT CANT FORM NEW DATA TBL %s "
+                          "INDEX %d FROM %s INDEX %d ",
                           bct->dstdb->tablename, bct->dixnum,
                           bct->srcdb->tablename, bct->sixnum);
-                *errout = OP_FAILED_INTERNAL + ERR_FORM_KEY;
-                close_constraint_table_cursor(cur);
-                return ERR_CONVERT_IX;
-            }
-            snprintf(ondisk_tag, sizeof(ondisk_tag) - 1, ".ONDISK_IX_%d",
-                     bct->sixnum);
-            snprintf(dondisk_tag, sizeof(dondisk_tag) - 1, ".ONDISK_IX_%d",
-                     bct->dixnum);
+            reqmoref(iq, " RC %d", rc);
+            reqerrstr(iq, COMDB2_CSTRT_RC_INVL_DTA,
+                      "verify key constraint cannot form new data table "
+                      "'%s' index %d from %s index %d ",
+                      bct->dstdb->tablename, bct->dixnum, bct->srcdb->tablename,
+                      bct->sixnum);
+            *errout = OP_FAILED_INTERNAL + ERR_FORM_KEY;
+            close_constraint_table_cursor(cur);
+            return ERR_CONVERT_IX;
+        }
+        snprintf(ondisk_tag, sizeof(ondisk_tag) - 1, ".ONDISK_IX_%d",
+                 bct->sixnum);
+        snprintf(dondisk_tag, sizeof(dondisk_tag) - 1, ".ONDISK_IX_%d",
+                 bct->dixnum);
 
-            int nullck = 0;
+        int nullck = 0;
 
-            keylen = rc = stag_to_stag_buf_ckey(
-                bct->srcdb->tablename, ondisk_tag, skey, bct->dstdb->tablename,
-                dondisk_tag, dkey, &nullck, FK2PK);
-            if (rc == -1) {
-                if (iq->debug)
-                    reqprintf(iq, "VERBKYCNSTRT CANT FORM TBL %s INDEX %d FROM "
-                                  "%s INDEX %d KEY ",
-                              bct->dstdb->tablename, bct->dixnum,
-                              bct->srcdb->tablename, bct->sixnum);
-                reqerrstr(iq, COMDB2_CSTRT_RC_INVL_DTA,
-                          "verify key constraint cannot form table '%s' index "
-                          "%d from %s index %d key '%s",
+        keylen = rc = stag_to_stag_buf_ckey(bct->srcdb->tablename, ondisk_tag,
+                                            skey, bct->dstdb->tablename,
+                                            dondisk_tag, dkey, &nullck, FK2PK);
+        if (rc == -1) {
+            if (iq->debug)
+                reqprintf(iq,
+                          "VERBKYCNSTRT CANT FORM TBL %s INDEX %d FROM "
+                          "%s INDEX %d KEY ",
                           bct->dstdb->tablename, bct->dixnum,
-                          bct->srcdb->tablename, bct->sixnum,
-                          get_keynm_from_db_idx(bct->srcdb, bct->sixnum));
-                reqdumphex(iq, skey, bct->sixlen);
+                          bct->srcdb->tablename, bct->sixnum);
+            reqerrstr(iq, COMDB2_CSTRT_RC_INVL_DTA,
+                      "verify key constraint cannot form table '%s' index "
+                      "%d from %s index %d key '%s",
+                      bct->dstdb->tablename, bct->dixnum, bct->srcdb->tablename,
+                      bct->sixnum,
+                      get_keynm_from_db_idx(bct->srcdb, bct->sixnum));
+            reqdumphex(iq, skey, bct->sixlen);
+            reqmoref(iq, " RC %d", rc);
+            *errout = OP_FAILED_INTERNAL + ERR_FORM_KEY;
+            close_constraint_table_cursor(cur);
+            return ERR_CONVERT_IX;
+        }
+
+        /* Ignore records with null columns if nullfkey is set */
+        if (should_skip_constraint_for_index(iq, bct->sixnum, nullck)) {
+            if (iq->debug) {
+                reqprintf(iq,
+                          "VERBKYCNSTRT NULL COLUMN PREVENTS FOREIGN "
+                          "REF %s INDEX %d.",
+                          bct->srcdb->tablename, bct->sixnum);
+            }
+            continue; /* TODO: why do we not get next? */
+        }
+
+        if (bct->dstdb->ix_collattr[bct->dixnum]) {
+            rc = extract_decimal_quantum(bct->dstdb, bct->dixnum, dkey, NULL, 0,
+                                         NULL);
+            if (rc) {
+                abort();
+            }
+        }
+
+        iq->usedb = bct->dstdb;
+        rc = ix_find_by_key_tran(iq, dkey, keylen, bct->dixnum, key, &fndrrn,
+                                 &fndgenid, NULL, NULL, 0, trans);
+        iq->usedb = currdb;
+
+        if (rc == RC_INTERNAL_RETRY) {
+            *errout = OP_FAILED_INTERNAL + ERR_FORM_KEY;
+            close_constraint_table_cursor(cur);
+            return rc;
+        }
+
+        /* key was found in parent tbl, no need to delete */
+        if (rc == IX_FND || rc == IX_FNDMORE) {
+            if (iq->debug) {
+                reqprintf(iq,
+                          "VERBKYCNSTRT VERIFIED TBL %s IX %d AGAINST "
+                          "TBL %s IX %d ",
+                          bct->dstdb->tablename, bct->dixnum,
+                          bct->srcdb->tablename, bct->sixnum);
+                reqdumphex(iq, bct->key, bct->sixlen);
                 reqmoref(iq, " RC %d", rc);
-                *errout = OP_FAILED_INTERNAL + ERR_FORM_KEY;
-                close_constraint_table_cursor(cur);
-                return ERR_CONVERT_IX;
             }
+            rc = bdb_temp_table_next(thedb->bdb_env, cur, &err);
+            continue;
+        }
 
-            /* Ignore records with null columns if nullfkey is set */
-            if (should_skip_constraint_for_index(iq, bct->sixnum, nullck)) {
-                if (iq->debug) {
-                    reqprintf(iq, "VERBKYCNSTRT NULL COLUMN PREVENTS FOREIGN "
-                                  "REF %s INDEX %d.",
-                              bct->srcdb->tablename, bct->sixnum);
-                }
-                continue;
+        /* key was not found in parent tbl, will need to delete from this tbl */
+        if (del_cascade) {
+            /* do cascade logic here */
+            int err = 0, idx = 0;
+            if (iq->debug) {
+                reqprintf(iq, "VERBKYCNSTRT CASCADE DELETE TBL %s RRN %d ",
+                          bct->srcdb->tablename, rrn);
             }
+            iq->usedb = bct->srcdb;
+            if (iq->debug)
+                reqpushprefixf(iq, "VERBKYCNSTRT CASCADE DEL:");
+            /* TODO verify we have proper schema change locks */
 
-            if (bct->dstdb->ix_collattr[bct->dixnum]) {
-                rc = extract_decimal_quantum(bct->dstdb, bct->dixnum, dkey, NULL,
-                                           0, NULL);
-                if (rc) {
-                    abort();
-                }
-            }
-
-            iq->usedb = bct->dstdb;
-            rc = ix_find_by_key_tran(iq, dkey, keylen, bct->dixnum, key,
-                                     &fndrrn, &fndgenid, NULL, NULL, 0, trans);
+            rc = del_record(iq, trans, NULL, rrn, genid, -1ULL, &err, &idx,
+                            BLOCK2_DELKL,
+                            RECFLAGS_DONT_LOCK_TBL | RECFLAGS_DONT_REORDER_IDX);
+            if (iq->debug)
+                reqpopprefixes(iq, 1);
             iq->usedb = currdb;
 
-            if (rc == RC_INTERNAL_RETRY) {
-                *errout = OP_FAILED_INTERNAL + ERR_FORM_KEY;
+            if (rc != 0) {
+                if (iq->debug) {
+                    reqprintf(iq,
+                              "VERBKYCNSTRT CANT CASCADE DELETE "
+                              "TBL %s RRN %d RC %d ",
+                              bct->srcdb->tablename, rrn, rc);
+                }
+                if (rc == ERR_TRAN_TOO_BIG) {
+                    reqerrstr(iq, COMDB2_CSTRT_RC_CASCADE,
+                              "cascaded delete exceeds max writes");
+                    *errout = OP_FAILED_INTERNAL + ERR_TRAN_TOO_BIG;
+                } else {
+                    reqerrstr(iq, COMDB2_CSTRT_RC_CASCADE,
+                              "verify key constraint cannot cascade delete "
+                              "table '%s' rc %d",
+                              bct->srcdb->tablename, rc);
+                    *errout = OP_FAILED_INTERNAL + ERR_FIND_CONSTRAINT;
+                }
                 close_constraint_table_cursor(cur);
                 return rc;
             }
+            /* here, we need to retry to verify the constraint */
+            /* sub 1 to go to current constraint again */
+            continue;
+        } else if (upd_cascade) {
+            int err = 0, idx = 0;
+            unsigned long long newgenid;
+            int newkeylen;
 
-            if (rc != IX_FND && rc != IX_FNDMORE && !cascade) {
-                if (iq->debug) {
-                    reqprintf(iq, "VERBKYCNSTRT CANT RESOLVE CONSTRAINT TBL %s "
-                                  "IDX '%d' KEY -> TBL %s IDX '%d' ",
-                              bct->dstdb->tablename, bct->dixnum,
-                              bct->srcdb->tablename, bct->sixnum);
-                    reqdumphex(iq, bct->key, bct->sixlen);
-                    reqmoref(iq, " RC %d", rc);
-                }
-                reqerrstr(iq, COMDB2_CSTRT_RC_INVL_KEY,
-                          "verify key constraint cannot resolve constraint "
-                          "table '%s' index '%d' key '%s' -> table '%s' index "
-                          "'%d' ",
-                          bct->dstdb->tablename, bct->dixnum,
-                          get_keynm_from_db_idx(bct->dstdb, bct->dixnum),
-                          bct->srcdb->tablename, bct->sixnum);
-                *errout = OP_FAILED_INTERNAL + ERR_FIND_CONSTRAINT;
-                close_constraint_table_cursor(cur);
-                return ERR_BADREQ;
-            } else if (rc == IX_FND || rc == IX_FNDMORE) {
-                if (iq->debug) {
-                    reqprintf(iq, "VERBKYCNSTRT VERIFIED TBL %s IX %d AGAINST "
-                                  "TBL %s IX %d ",
-                              bct->dstdb->tablename, bct->dixnum,
-                              bct->srcdb->tablename, bct->sixnum);
-                    reqdumphex(iq, bct->key, bct->sixlen);
-                    reqmoref(iq, " RC %d", rc);
-                }
-                rc = bdb_temp_table_next(thedb->bdb_env, cur, &err);
-                continue;
-            } else if (cascade) {
-                /* do cascade logic here */
-                if (del_cascade) {
-                    int err = 0, idx = 0;
-                    if (iq->debug) {
-                        reqprintf(iq,
-                                  "VERBKYCNSTRT CASCADE DELETE TBL %s RRN %d ",
-                                  bct->srcdb->tablename, rrn);
-                    }
-                    iq->usedb = bct->srcdb;
-                    if (iq->debug)
-                        reqpushprefixf(iq, "VERBKYCNSTRT CASCADE DEL:");
-                    /* TODO verify we have proper schema change locks */
+            iq->usedb = bct->srcdb;
+            newkeylen = getkeysize(iq->usedb, bct->sixnum);
 
-                    rc = del_record(iq, trans, NULL, rrn, genid, -1ULL, &err,
-                                    &idx, BLOCK2_DELKL, RECFLAGS_DONT_LOCK_TBL);
-                    if (iq->debug)
-                        reqpopprefixes(iq, 1);
-                    iq->usedb = currdb;
-                    if (rc != 0) {
-                        if (iq->debug) {
-                            reqprintf(iq, "VERBKYCNSTRT CANT CASCADE DELETE "
-                                          "TBL %s RRN %d RC %d ",
-                                      bct->srcdb->tablename, rrn, rc);
-                        }
-                        if (rc == ERR_TRAN_TOO_BIG) {
-                            reqerrstr(iq, COMDB2_CSTRT_RC_CASCADE,
-                                      "cascaded delete exceeds max writes");
-                            *errout = OP_FAILED_INTERNAL + ERR_TRAN_TOO_BIG;
-                        } else {
-                            reqerrstr(
-                                iq, COMDB2_CSTRT_RC_CASCADE,
-                                "verify key constraint cannot cascade delete "
-                                "table '%s' rrn %d",
-                                bct->srcdb->tablename, rrn);
-                            *errout = OP_FAILED_INTERNAL + ERR_FIND_CONSTRAINT;
-                        }
-                        close_constraint_table_cursor(cur);
-                        if (rc == RC_INTERNAL_RETRY)
-                            return rc; /* bubble up internal retry */
-                        return ERR_BADREQ;
-                    }
-                    /* here, we need to retry to verify the constraint */
-                    /* sub 1 to go to current constraint again */
-                    continue;
-                } /* if (isdeleteop) */
-                else if (upd_cascade) {
-                    int err = 0, idx = 0;
-                    unsigned long long newgenid;
-                    int newkeylen;
-
-                    memset(nulls, 0, sizeof(nulls));
-                    iq->usedb = bct->srcdb;
-                    newkeylen = getkeysize(iq->usedb, bct->sixnum);
-
-                    if (gbl_fk_allow_superset_keys && newkeylen > bct->sixlen) {
-                        memcpy(bct->newkey + bct->sixlen, key + bct->sixlen,
-                               newkeylen - bct->sixlen);
-                    } else {
-                        newkeylen = bct->sixlen;
-                    }
-
-                    if (iq->debug)
-                        reqpushprefixf(iq, "VERBKYCNSTRT CASCADE UPD:");
-                    /* TODO verify we have proper schema change locks */
-
-                    rc = upd_record(
-                        iq, trans, NULL, /*primkey*/
-                        rrn, genid,
-                        (const unsigned char *)ondisk_tag, /*.ONDISK_IX_0*/
-                        (const unsigned char *)ondisk_tag + strlen(ondisk_tag),
-                        (unsigned char *)bct->newkey, /*p_buf_rec*/
-                        (const unsigned char *)bct->newkey + newkeylen,
-                        NULL /*p_buf_vrec*/, NULL /*p_buf_vrec_end*/,
-                        NULL, /*fldnullmap*/
-                        NULL, /*updCols*/
-                        NULL, /*blobs*/
-                        0,    /*maxblobs*/
-                        &newgenid, -1ULL, -1ULL, &err, &idx, BLOCK2_UPDKL,
-                        0, /*blkpos*/
-                        UPDFLAGS_CASCADE | RECFLAGS_DONT_LOCK_TBL);
-                    if (iq->debug)
-                        reqpopprefixes(iq, 1);
-                    iq->usedb = currdb;
-                    if (rc != 0) {
-                        if (iq->debug) {
-                            reqprintf(iq, "VERBKYCNSTRT CANT CASCADE UPDATE "
-                                          "TBL %s RRN %d RC %d ",
-                                      bct->srcdb->tablename, rrn, rc);
-                        }
-                        if (rc == ERR_TRAN_TOO_BIG) {
-                            reqerrstr(iq, COMDB2_CSTRT_RC_CASCADE,
-                                      "cascaded update exceeds max writes");
-                            *errout = OP_FAILED_INTERNAL + ERR_TRAN_TOO_BIG;
-                        } else {
-                            reqerrstr(
-                                iq, COMDB2_CSTRT_RC_CASCADE,
-                                "verify key constraint cannot cascade update "
-                                "table '%s' rrn %d",
-                                bct->srcdb->tablename, rrn);
-                            *errout = OP_FAILED_INTERNAL + ERR_FIND_CONSTRAINT;
-                        }
-                        close_constraint_table_cursor(cur);
-                        if (rc == RC_INTERNAL_RETRY)
-                            return rc; /* bubble up internal retry */
-                        return ERR_BADREQ;
-                    }
-                    /* here, we need to retry to verify the constraint */
-                    continue;
-                } else {
-                    /* if this code's hit, something's really wrong */
-                    if (iq->debug) {
-                        reqprintf(iq, "VERBKYCNSTRT INVALID CASCADE REQUEST %s "
-                                      "RRN %d RC %d ",
-                                  req2a(bct->optype), rrn, rc);
-                    }
-                    reqerrstr(iq, COMDB2_CSTRT_RC_CASCADE,
-                              "verify key constraint invalid cascade request "
-                              "%s rrn %d",
-                              req2a(bct->optype), rrn);
-                    *errout = OP_FAILED_INTERNAL;
-                    close_constraint_table_cursor(cur);
-                    return ERR_INTERNAL;
-                }
+            if (gbl_fk_allow_superset_keys && newkeylen > bct->sixlen) {
+                memcpy(bct->newkey + bct->sixlen, key + bct->sixlen,
+                       newkeylen - bct->sixlen);
+            } else {
+                newkeylen = bct->sixlen;
             }
+
+            if (iq->debug)
+                reqpushprefixf(iq, "VERBKYCNSTRT CASCADE UPD:");
+            /* TODO verify we have proper schema change locks */
+
+            rc = upd_record(
+                iq, trans, NULL,                               /*primkey*/
+                rrn, genid, (const unsigned char *)ondisk_tag, /*.ONDISK_IX_0*/
+                (const unsigned char *)ondisk_tag + strlen(ondisk_tag),
+                (unsigned char *)bct->newkey, /*p_buf_rec*/
+                (const unsigned char *)bct->newkey + newkeylen,
+                NULL /*p_buf_vrec*/, NULL /*p_buf_vrec_end*/,
+                NULL, /*fldnullmap*/
+                NULL, /*updCols*/
+                NULL, /*blobs*/
+                0,    /*maxblobs*/
+                &newgenid, -1ULL, -1ULL, &err, &idx, BLOCK2_UPDKL, 0, /*blkpos*/
+                UPDFLAGS_CASCADE | RECFLAGS_DONT_LOCK_TBL |
+                    RECFLAGS_DONT_REORDER_IDX);
+            if (iq->debug)
+                reqpopprefixes(iq, 1);
+            iq->usedb = currdb;
+
+            if (rc != 0) {
+                if (iq->debug) {
+                    reqprintf(iq,
+                              "VERBKYCNSTRT CANT CASCADE UPDATE "
+                              "TBL %s RRN %d RC %d ",
+                              bct->srcdb->tablename, rrn, rc);
+                }
+                if (rc == ERR_TRAN_TOO_BIG) {
+                    reqerrstr(iq, COMDB2_CSTRT_RC_CASCADE,
+                              "cascaded update exceeds max writes");
+                    *errout = OP_FAILED_INTERNAL + ERR_TRAN_TOO_BIG;
+                } else {
+                    reqerrstr(iq, COMDB2_CSTRT_RC_CASCADE,
+                              "verify key constraint cannot cascade update "
+                              "table '%s' rc %d",
+                              bct->srcdb->tablename, rc);
+                    *errout = OP_FAILED_INTERNAL + ERR_FIND_CONSTRAINT;
+                }
+                close_constraint_table_cursor(cur);
+                return rc;
+            }
+            /* here, we need to retry to verify the constraint */
+            continue;
+        } else { /* key was not found in parent tbl and we are not cascading */
+            if (iq->debug) {
+                reqprintf(iq,
+                          "VERBKYCNSTRT CANT RESOLVE CONSTRAINT TBL %s "
+                          "IDX '%d' KEY -> TBL %s IDX '%d' ",
+                          bct->dstdb->tablename, bct->dixnum,
+                          bct->srcdb->tablename, bct->sixnum);
+                reqdumphex(iq, bct->key, bct->sixlen);
+                reqmoref(iq, " RC %d", rc);
+            }
+            reqerrstr(iq, COMDB2_CSTRT_RC_INVL_KEY,
+                      "verify key constraint cannot resolve constraint "
+                      "table '%s' index '%d' key '%s' -> table '%s' index "
+                      "'%d' ",
+                      bct->dstdb->tablename, bct->dixnum,
+                      get_keynm_from_db_idx(bct->dstdb, bct->dixnum),
+                      bct->srcdb->tablename, bct->sixnum);
+            *errout = OP_FAILED_INTERNAL + ERR_FIND_CONSTRAINT;
+            close_constraint_table_cursor(cur);
+            return ERR_BADREQ;
         }
+
         /* get next record from table */
         rc = bdb_temp_table_next(thedb->bdb_env, cur, &err);
     }
@@ -948,6 +958,10 @@ int delayed_key_adds(struct ireq *iq, block_state_t *blkstate, void *trans,
     int od_tail_len = 0;
     char mangled_key[MAXKEYLEN];
 
+#if DEBUG_REORDER
+    logmsg(LOGMSG_DEBUG, "%s(): entering\n", __func__);
+#endif
+
     od_dta = alloca(20 * 1024 + 8);
     if (od_dta == NULL) {
         if (iq->debug)
@@ -986,7 +1000,6 @@ int delayed_key_adds(struct ireq *iq, block_state_t *blkstate, void *trans,
     unsigned long long genid = 0LL;
     unsigned long long cached_index_genid = genid;
     unsigned long long ins_keys = 0ULL;
-    int flags = 0;
     rc = bdb_temp_table_first(thedb->bdb_env, cur, &err);
     if (rc != 0) {
         close_constraint_table_cursor(cur);
@@ -1021,6 +1034,16 @@ int delayed_key_adds(struct ireq *iq, block_state_t *blkstate, void *trans,
             return ERR_INTERNAL;
         }
         struct forward_ct *curop = &ctrq->ctop.fwdct;
+        int flags = curop->flags;
+        /* Keys for records from INSERT .. ON CONFLICT DO NOTHING have
+         * already been added to the indexes in add_record() to ensure
+         * we don't add duplicates in the data files. We still push them
+         * to ct_add_table to be able to perform cascade updates to the
+         * child tables.
+         */
+        if (flags & OSQL_IGNORE_FAILURE || flags & OSQL_ITEM_REORDERED) {
+            goto next_record;
+        }
 
         /* only do once per genid *after* processing all idxs from tmptbl 
          * (which are in sequence for the same genid): 
@@ -1038,17 +1061,6 @@ int delayed_key_adds(struct ireq *iq, block_state_t *blkstate, void *trans,
         int ixnum = curop->ixnum;
         genid = curop->genid;
         ins_keys = curop->ins_keys;
-        flags = curop->flags;
-
-        /* Keys for records from INSERT .. ON CONFLICT DO NOTHING have
-         * already been added to the indexes in add_record() to ensure
-         * we don't add duplicates in the data files. We still push them
-         * to ct_add_table to be able to perform cascade updates to the
-         * child tables.
-         */
-        if ((flags & OSQL_IGNORE_FAILURE) != 0) {
-            goto next_record;
-        }
 
         if (addrrn == -1) {
             if (iq->debug)
@@ -1090,8 +1102,8 @@ int delayed_key_adds(struct ireq *iq, block_state_t *blkstate, void *trans,
                 reqprintf(iq, "%p:ADDKYCNSTRT FNDLEN %d != DTALEN %d RC %d",
                           trans, fndlen, ondisk_size, rc);
             reqerrstr(iq, COMDB2_CSTRT_RC_INVL_DTA,
-                      "add key constraint: FNDLEN %d != DTALEN %d rc %d",
-                      fndlen, ondisk_size, rc);
+                      "add key constraint: record not found in table %s",
+                      iq->usedb->tablename);
             *errout = OP_FAILED_INTERNAL;
             *blkpos = curop->blkpos;
             close_constraint_table_cursor(cur);
@@ -1237,7 +1249,7 @@ int delayed_key_adds(struct ireq *iq, block_state_t *blkstate, void *trans,
                 logmsg(LOGMSG_ERROR, "%s failed to cache delayed indexes\n",
                         __func__);
                 *errout = OP_FAILED_INTERNAL;
-                close_constraint_table_cursor(cur);
+                close_constraint_table_cursor(cur); // AZ: this is wrong!?
                 return ERR_INTERNAL;
             }
             cached_index_genid = genid;
@@ -1255,12 +1267,12 @@ int delayed_key_adds(struct ireq *iq, block_state_t *blkstate, void *trans,
     return ERR_INTERNAL;
 }
 
-/* go through all entries in ct_add_table and */
-int verify_add_constraints(struct javasp_trans_state *javasp_trans_handle,
-                           struct ireq *iq, block_state_t *blkstate,
+/* go through all entries in ct_add_table and verify that
+ * the key exists in the parent table if there are constraints */
+int verify_add_constraints(struct ireq *iq, block_state_t *blkstate,
                            void *trans, int *errout)
 {
-    int rc = 0, fndlen = 0, fndrrn = 0, opcode = 0, err = 0;
+    int rc = 0, fndrrn = 0, opcode = 0, err = 0;
     void *od_dta = NULL;
     char ondisk_tag[MAXTAGLEN];
     char key[MAXKEYLEN];
@@ -1317,7 +1329,7 @@ int verify_add_constraints(struct javasp_trans_state *javasp_trans_handle,
     while (rc == 0) {
         cte *ctrq = (cte *)bdb_temp_table_data(cur);
         struct forward_ct *curop = NULL;
-        int addrrn = -1, ixnum = -1;
+        int ixnum = -1;
         int ondisk_size = 0;
         /* do something */
         if (ctrq == NULL) {
@@ -1340,7 +1352,6 @@ int verify_add_constraints(struct javasp_trans_state *javasp_trans_handle,
         }
 
         iq->usedb = curop->usedb;
-        addrrn = curop->rrn;
         ixnum = curop->ixnum;
         genid = curop->genid;
         ins_keys = curop->ins_keys;
@@ -1388,26 +1399,28 @@ int verify_add_constraints(struct javasp_trans_state *javasp_trans_handle,
                 cached_index_genid = curop->genid;
             }
 
+            /* load original row in od_dta, needed to form the indices */
+            int fndlen = 0;
+            int addrrn = curop->rrn;
             rc = ix_find_by_rrn_and_genid_tran(iq, addrrn, genid, od_dta,
                                                &fndlen, ondisk_size, trans);
 
-            if (rc == RC_INTERNAL_RETRY) {
+            if (rc) {
                 *errout = OP_FAILED_INTERNAL;
                 close_constraint_table_cursor(cur);
-                return rc;
-            }
 
-            /* make sure fndlen is not overwritten in the meantime,
-               since rc can be an error code! */
-            if (fndlen != ondisk_size) {
+                if (rc == RC_INTERNAL_RETRY)
+                    return rc;
+
                 if (iq->debug)
-                    reqprintf(iq, "VERKYCNSTRT FNDLEN %d != DTALEN %d", fndlen,
-                              ondisk_size);
+                    reqprintf(iq,
+                              "VERKYCNSTRT CASCADE DELETED GENID 0x%llx "
+                              "FNDLEN %d DTALEN %d RC %d",
+                              genid, fndlen, ondisk_size, rc);
                 reqerrstr(iq, COMDB2_CSTRT_RC_INVL_DTA,
-                          "verify key constraint FNDLEN %d != DTALEN %d",
-                          fndlen, ondisk_size);
-                *errout = OP_FAILED_INTERNAL;
-                close_constraint_table_cursor(cur);
+                          "verify key constraint: record not found in table %s "
+                          "(cascaded)",
+                          iq->usedb->tablename);
                 return ERR_INTERNAL;
             }
 
@@ -1701,6 +1714,7 @@ int clear_constraints_tables(void)
     truncate_constraint_table(thdinfo->ct_add_table);
     truncate_constraint_table(thdinfo->ct_del_table);
     truncate_constraint_table(thdinfo->ct_add_index);
+    truncate_defered_index_tbl();
 
     return 0;
 }
@@ -1802,16 +1816,20 @@ void *create_constraint_index_table()
     return newtbl;
 }
 
-static inline void *get_constraint_table_cursor(void *table)
+inline void *get_constraint_table_cursor(void *table)
 {
-    struct temp_cursor *cur = NULL;
+    if (table == NULL)
+        abort();
     int err = 0;
-    cur = (struct temp_cursor *)bdb_temp_table_cursor(thedb->bdb_env, table,
-                                                      NULL, &err);
+    struct temp_cursor *cur =
+        bdb_temp_table_cursor(thedb->bdb_env, table, NULL, &err);
+    if (!cur) {
+        logmsg(LOGMSG_ERROR, "Can't create cursor err=%d\n", err);
+    }
     return cur;
 }
 
-static inline int close_constraint_table_cursor(void *cursor)
+inline int close_constraint_table_cursor(void *cursor)
 {
     int err = 0, rc = 0;
     rc = bdb_temp_table_close_cursor(thedb->bdb_env, cursor, &err);
@@ -1962,6 +1980,7 @@ int verify_constraints_exist(struct dbtable *from_db, struct dbtable *to_db,
 
     for (ii = 0; ii < from_db->n_constraints; ii++) {
         constraint_t *ct = &from_db->constraints[ii];
+
         if (from_db == new_db) {
             snprintf(keytag, sizeof(keytag), ".NEW.%s", ct->lclkeyname);
         } else {
@@ -1997,7 +2016,8 @@ int verify_constraints_exist(struct dbtable *from_db, struct dbtable *to_db,
                 n_errors++;
                 continue;
             } else {
-                if (timepart_is_shard(rdb->tablename, 1, NULL)) {
+                if (timepart_is_shard(rdb->tablename, (!s || !s->views_locked),
+                                      NULL)) {
                     constraint_err(s, from_db, ct, jj,
                                    "foreign table is a shard");
                     n_errors++;

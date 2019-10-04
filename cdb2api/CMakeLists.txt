@@ -21,7 +21,7 @@ set_source_files_properties(
 include_directories(
   ${PROJECT_SOURCE_DIR}/bbinc
   ${PROJECT_BINARY_DIR}/protobuf
-  ${PROTOBUF_C_INCLUDE_DIR}
+  ${PROTOBUF-C_INCLUDE_DIR}
   ${OPENSSL_INCLUDE_DIR}
 )
 
@@ -50,7 +50,8 @@ if(NOT COMDB2_SKIP_CDB2API_SO)
   if (NOT COMDB2_BUILD_STATIC)
     target_link_libraries(cdb2api_shared
       ${OPENSSL_LIBRARIES}
-      ${PROTOBUF_C_LIBRARY}
+      ${ZLIB_LIBRARIES}
+      ${PROTOBUF-C_LIBRARY}
       ${UNWIND_LIBRARY}
     )
   endif()

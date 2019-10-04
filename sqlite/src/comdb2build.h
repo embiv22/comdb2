@@ -67,15 +67,18 @@ void comdb2DropPrimaryKey(Parse *);
 void comdb2AddIndex(Parse *, Token *, ExprList *, int, Expr *, const char *,
                     const char *, int, u8, int);
 void comdb2AddDbpad(Parse *, int);
+void comdb2AddCheckConstraint(Parse *, Expr *, const char *, const char *);
 void comdb2CreateIndex(Parse *, Token *, Token *, SrcList *, ExprList *, int,
                        Token *, Expr *, const char *, const char *, int, int,
                        u8, int, int);
 void comdb2CreateForeignKey(Parse *, ExprList *, Token *, ExprList *, int);
 void comdb2DeferForeignKey(Parse *, int);
 void comdb2DropForeignKey(Parse *, Token *);
+void comdb2DropConstraint(Parse *, Token *);
 void comdb2DropColumn(Parse *, Token *);
 void comdb2DropIndex(Parse *, Token *, Token *, int);
 void comdb2AlterDropIndex(Parse *, Token *);
+void comdb2AlterCommitPending(Parse *);
 
 void comdb2enableGenid48(Parse*, int);
 void comdb2enableRowlocks(Parse*, int);
@@ -96,19 +99,18 @@ void comdb2RebuildData(Parse*, Token*, Token*,int opt);
 void comdb2RebuildDataBlob(Parse*,Token*, Token*,int opt);
 void comdb2Truncate(Parse*, Token*, Token*);
 
+void comdb2SchemachangeControl(Parse*, int, Token*, Token *);
+
 void comdb2bulkimport(Parse*, Token*, Token*, Token*, Token*);
 
 void comdb2CreateProcedure(Parse*, Token*, Token*, Token*);
 void comdb2DefaultProcedure(Parse*, Token*, Token*, int);
 void comdb2DropProcedure(Parse*, Token*, Token*, int);
 
-void comdb2CreateTimePartition(Parse* p, Token* table, Token* name, 
-                           Token* period,Token* retention, Token* start);
 
-void comdb2DropTimePartition(Parse* p, Token* name);
-
-void comdb2CreateTimePartition(Parse* p, Token* table, Token* name, 
+void comdb2CreatePartition(Parse* p, Token* table, Token* name, 
                                Token* period, Token* retention, Token* start);
+void comdb2DropPartition(Parse* p, Token* name);
 
 void comdb2analyze(Parse*, int opt, Token*, Token*, int);
 
@@ -116,6 +118,8 @@ void comdb2grant(Parse* pParse, int revoke, int permission, Token* nm,
         Token* lnm, Token* u);
 
 void comdb2timepartRetention(Parse*, Token*, Token*, int val);
+void comdb2CounterIncr(Parse*, Token*, Token*);
+void comdb2CounterSet(Parse*, Token*, Token*, long long val);
 
 void comdb2enableAuth(Parse* pParse, int on);
 void comdb2setPassword(Parse* pParse, Token* password, Token* nm);
@@ -123,7 +127,7 @@ void comdb2deletePassword(Parse* pParse, Token* nm);
 int  comdb2genidcontainstime(void);
 void comdb2schemachangeCommitsleep(Parse* pParse, int num);
 void comdb2schemachangeConvertsleep(Parse* pParse, int num);
-void comdb2putTunable(Parse *pParse, Token *name, Token *value);
+void comdb2putTunable(Parse*, Token*, Token*, Token*);
 
 enum
 {
@@ -135,6 +139,7 @@ enum
 void comdb2getkw(Parse* pParse, int reserved);
 int comdb2TokenToStr(Token *nm, char *buf, size_t len);
 
+int comdb2IsPrepareOnly(Parse* pParse);
 int comdb2AuthenticateUserOp(Parse* pParse);
 
 #endif // COMDB2BUILD_H

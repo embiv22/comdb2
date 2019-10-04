@@ -43,7 +43,6 @@
 #include <f2cstr.h>
 #include <list.h>
 #include <plhash.h>
-#include <lockmacro.h>
 #include <memory_sync.h>
 #include <rtcpu.h>
 #include <unistd.h>
@@ -83,7 +82,6 @@
 int (*comdb2_ipc_swapnpasdb_sinfo)(struct ireq *) = 0;
 
 extern int is_buffer_from_remote(const void *buf);
-
 extern pthread_t gbl_invalid_tid;
 extern int gbl_enable_berkdb_retry_deadlock_bias;
 extern int gbl_osql_verify_retries_max;
@@ -95,16 +93,24 @@ extern pthread_mutex_t commit_stat_lk;
 extern pthread_mutex_t osqlpf_mutex;
 extern int gbl_prefault_udp;
 extern int gbl_reorder_socksql_no_deadlock;
+extern int gbl_reorder_idx_writes;
+extern int gbl_print_blockp_stats;
+extern int gbl_dump_blkseq;
+extern __thread int send_prefault_udp;
+extern void delay_if_sc_resuming(struct ireq *iq);
+extern unsigned int gbl_delayed_skip;
+
+int gbl_osql_snap_info_hashcheck = 1;
 
 #if 0
-#define BACKOUT                                                                \
+#define GOTOBACKOUT                                                            \
     do {                                                                       \
         printf("***BACKOUT*** from %d rc %d\n", __LINE__, rc);                 \
         if (1)                                                                 \
             goto backout;                                                      \
     } while (0)
 #else
-#define BACKOUT                                                                \
+#define GOTOBACKOUT                                                            \
     do {                                                                       \
         fromline = __LINE__;                                                   \
         goto backout;                                                          \
@@ -147,9 +153,9 @@ static int block2_qadd(struct ireq *iq, block_state_t *p_blkstate, void *trans,
 
     if (buf->qnamelen > sizeof(qname) - 1) {
         if (iq->debug)
-            reqprintf(iq, "NAME TOO LONG %d>%d", buf->qnamelen,
+            reqprintf(iq, "NAME TOO LONG %u>%zu", buf->qnamelen,
                       sizeof(qname) - 1);
-        reqerrstr(iq, COMDB2_CUST_RC_NAME_SZ, "queue name to long %d>%d",
+        reqerrstr(iq, COMDB2_CUST_RC_NAME_SZ, "queue name to long %u>%zu",
                   buf->qnamelen, sizeof(qname) - 1);
         return ERR_BADREQ;
     }
@@ -179,7 +185,7 @@ static int block2_qadd(struct ireq *iq, block_state_t *p_blkstate, void *trans,
 
     if (!blobs[0].exists) {
         if (iq->debug)
-            reqprintf(iq, "EXPECTED ONE BLOB", cblob);
+            reqprintf(iq, "EXPECTED AT LEAST ONE BLOB");
         reqerrstr(iq, COMDB2_QADD_RC_BAD_BLOB_BUFF,
                   "expected one blob (internal api error)");
         return ERR_BADREQ;
@@ -325,7 +331,7 @@ void toblock_init(void)
 #undef add_blockop
     /* a runtime assert to make sure we have the right size of blockop count
      * array */
-    if (index > NUM_BLOCKOP_OPCODES) {
+    if (index >= NUM_BLOCKOP_OPCODES) {
         logmsg(LOGMSG_FATAL, "%s: too many blockops defined!\n", __func__);
         logmsg(LOGMSG_FATAL, "%s: you need to increase NUM_BLOCKOP_OPCODES to %d\n",
                 __func__, index);
@@ -465,7 +471,7 @@ static int forward_longblock_to_master(struct ireq *iq,
     /*have a valid master to pass this off to. */
     if (iq->debug)
         reqprintf(iq, "forwarded req from %s to master node %s db %d rqlen "
-                      "%d\n",
+                      "%zu\n",
                   getorigin(iq), mstr, iq->origdb->dbnum, req_len);
     if (iq->is_socketrequest) {
         if (iq->sb == NULL) {
@@ -525,7 +531,7 @@ static int forward_block_to_master(struct ireq *iq, block_state_t *p_blkstate,
 
     if (iq->debug)
         reqprintf(iq, "forwarded req from %s to master node %s db %d rqlen "
-                      "%d\n",
+                      "%zu\n",
                   getorigin(iq), mstr, iq->origdb->dbnum, req_len);
 
     if (iq->is_socketrequest) {
@@ -759,8 +765,6 @@ static void block_state_free(block_state_t *p_blkstate)
     p_blkstate->p_buf_saved_start = NULL;
 }
 
-extern int gbl_dump_blkseq;
-
 unsigned long long blkseq_replay_count = 0;
 unsigned long long blkseq_replay_error_count = 0;
 
@@ -788,9 +792,10 @@ static int do_replay_case(struct ireq *iq, void *fstseqnum, int seqlen,
 
     if (!replay_data) {
 
-        if (!iq->have_snap_info)
+        if (!iq->have_snap_info) {
             assert( (seqlen == (sizeof(fstblkseq_t))) || 
                     (seqlen == (sizeof(uuid_t))));
+        }
 
         rc = bdb_blkseq_find(thedb->bdb_env, NULL, fstseqnum, seqlen,
                              &replay_data, &replay_data_len);
@@ -951,14 +956,10 @@ static int do_replay_case(struct ireq *iq, void *fstseqnum, int seqlen,
                 if (!(p_fstblk_buf = (uint8_t *)buf_get(&(snapinfo_outrc), sizeof(snapinfo_outrc), 
                         p_fstblk_buf, p_fstblk_buf_end)))  {
                     abort();
-                    blkseq_line = __LINE__;
-                    goto replay_error;
                 }
                 if (!(p_fstblk_buf = (uint8_t *)osqlcomm_errstat_type_get(&(iq->errstat), 
                         p_fstblk_buf, p_fstblk_buf_end))) {
                     abort();
-                    blkseq_line = __LINE__;
-                    goto replay_error;
                 }
             }
 
@@ -1096,8 +1097,7 @@ static int do_replay_case(struct ireq *iq, void *fstseqnum, int seqlen,
 
     if (gbl_dump_blkseq && iq->have_snap_info) {
         logmsg(LOGMSG_USER,
-               "Replay case for '%s' rc=%d, errval=%d errstr='%s' "
-               "rcout=%d\n",
+               "Replay case for '%s' rc=%d, errval=%d errstr='%s' rcout=%d\n",
                cnonce, outrc, iq->errstat.errval, iq->errstat.errstr,
                iq->sorese.rcout);
     }
@@ -2349,8 +2349,6 @@ static int extract_blkseq2(struct ireq *iq, block_state_t *p_blkstate,
 
 static pthread_rwlock_t commit_lock = PTHREAD_RWLOCK_INITIALIZER;
 
-extern __thread int send_prefault_udp;
-extern void delay_if_sc_resuming(struct ireq *iq);
 
 void handle_postcommit_bpfunc(struct ireq *iq)
 {
@@ -2359,7 +2357,8 @@ void handle_postcommit_bpfunc(struct ireq *iq)
     while((cur_bpfunc = listc_rtl(&iq->bpfunc_lst)))
     {
         assert(cur_bpfunc->func->success != NULL);
-        cur_bpfunc->func->success(NULL/*not used*/, cur_bpfunc->func, NULL);
+        cur_bpfunc->func->success(NULL /*not used*/, cur_bpfunc->func,
+                                  &iq->errstat);
         free_bpfunc(cur_bpfunc->func);
     }
 }
@@ -2370,7 +2369,8 @@ void handle_postabort_bpfunc(struct ireq *iq)
     while((cur_bpfunc = listc_rtl(&iq->bpfunc_lst)))
     {
         assert(cur_bpfunc->func->fail != NULL);
-        cur_bpfunc->func->fail(NULL/*not used*/, cur_bpfunc->func, NULL);
+        cur_bpfunc->func->fail(NULL /*not used*/, cur_bpfunc->func,
+                               &iq->errstat);
         free_bpfunc(cur_bpfunc->func);
     }
 }
@@ -2561,7 +2561,8 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
     int have_blkseq = 0;
     bool have_keyless_requests = 0;
     int numerrs = 0;
-    int constraint_violation = 0;
+    int check_serializability = 0;
+    int force_serial_error = 0;
     struct block_err err;
     int opcode_counts[NUM_BLOCKOP_OPCODES];
     int nops = 0;
@@ -2644,6 +2645,10 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
     if (lrc)
         return lrc;
 
+    uint64_t strt = comdb2_time_epochus();
+    reqlog_set_queue_time(iq->reqlogger, strt - iq->startus);
+    reqlog_set_startprcs(iq->reqlogger, strt);
+
     /* adding this back temporarily so I can get blockop counts again. this
        really just belongs in the main loop (should get its own logger event
        flag and logger events for this flag should be reset in the case of a
@@ -2682,7 +2687,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
                                         &have_blkseq);
                     if (rc) {
                         logmsg(LOGMSG_ERROR, "failed to extract blockseq\n");
-                        BACKOUT;
+                        GOTOBACKOUT;
                     }
                     if (have_blkseq) {
                         got_blockseq = 1;
@@ -2700,7 +2705,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
                                          &have_blkseq);
                     if (rc) {
                         logmsg(LOGMSG_ERROR, "failed to extract blockseq\n");
-                        BACKOUT;
+                        GOTOBACKOUT;
                     }
                     if (have_blkseq) {
                         got_blockseq2 = 1;
@@ -2720,9 +2725,14 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
         }
 
         if (got_osql && iq->have_snap_info) {
+            if (gbl_osql_snap_info_hashcheck) {
+                // the goal here is to stall until the original transaction
+                // has finished that way we can retrieve the outcome from blkseq
+                osql_blkseq_register_cnonce(iq);
+            }
+
             void *replay_data = NULL;
             int replay_len = 0;
-            int findout;
             bdb_get_readlock(thedb->bdb_env, "early_replay_cnonce", __func__,
                              __LINE__);
             if (thedb->master != gbl_mynode) {
@@ -2731,11 +2741,13 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
                 fromline = __LINE__;
                 goto cleanup;
             }
-            findout = bdb_blkseq_find(thedb->bdb_env, parent_trans,
-                                      iq->snap_info.key, iq->snap_info.keylen,
-                                      &replay_data, &replay_len);
-            if (findout == 0) {
-                logmsg(LOGMSG_WARN, "early snapinfo blocksql replay detected\n");
+            int found;
+            found = bdb_blkseq_find(thedb->bdb_env, parent_trans,
+                                    iq->snap_info.key, iq->snap_info.keylen,
+                                    &replay_data, &replay_len);
+            if (!found) {
+                logmsg(LOGMSG_WARN,
+                       "early snapinfo blocksql replay detected\n");
                 outrc = do_replay_case(iq, iq->snap_info.key,
                                        iq->snap_info.keylen, num_reqs, 0,
                                        replay_data, replay_len, __LINE__);
@@ -2838,7 +2850,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
             if (thedb->master != gbl_mynode || irc == ERR_NOMASTER) {
                 numerrs = 1;
                 rc = ERR_NOMASTER; /*this is what bdb readonly error gets us */
-                BACKOUT;
+                GOTOBACKOUT;
             }
         }
     }
@@ -2848,7 +2860,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
                __LINE__, irc);
         numerrs = 1;
         rc = irc;
-        BACKOUT;
+        GOTOBACKOUT;
     }
 
     if (iq->debug) {
@@ -2882,7 +2894,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
             if (rc) {
                 if (rc != RC_INTERNAL_RETRY)
                     logmsg(LOGMSG_ERROR, "get_next_seqno unexpected rc %d\n", rc);
-                BACKOUT;
+                GOTOBACKOUT;
             }
             p_blkstate->seqno = seqno;
         }
@@ -2904,7 +2916,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
                 reqprintf(iq, "%p:BAD BUFFER OFFSET OP %d", trans, opnum);
 
             rc = ERR_BADREQ;
-            BACKOUT;
+            GOTOBACKOUT;
         }
 
         if (iq->debug) {
@@ -2974,7 +2986,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
                 if (iq->debug)
                     reqprintf(iq, "FAILED TO UNPACK");
                 rc = ERR_BADREQ;
-                BACKOUT;
+                GOTOBACKOUT;
             }
 
             loadnullbmp(nulls, sizeof(nulls), updbykey.fldnullmap,
@@ -2985,7 +2997,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
                 if (iq->debug)
                     reqprintf(iq, "FAILED TO UNPACK TAG NAME");
                 rc = ERR_BADREQ;
-                BACKOUT;
+                GOTOBACKOUT;
             }
 
             p_buf_tag_name = iq->p_buf_in;
@@ -2997,7 +3009,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
                 if (iq->debug)
                     reqprintf(iq, "FAILED TO UNPACK DATA");
                 rc = ERR_BADREQ;
-                BACKOUT;
+                GOTOBACKOUT;
             }
 
             /*
@@ -3020,7 +3032,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
                                                  &trans, &osql_needtransaction);
                     if (rc) {
                         numerrs = 1;
-                        BACKOUT;
+                        GOTOBACKOUT;
                     }
                 } else {
                     logmsg(LOGMSG_FATAL, "%s:%d NULL TRANSACTION!\n", __FILE__,
@@ -3038,7 +3050,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
             free_blob_buffers(blobs, MAXBLOBS);
             if (rc != 0) {
                 numerrs = 1;
-                BACKOUT;
+                GOTOBACKOUT;
             }
             break;
         }
@@ -3059,7 +3071,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
                 if (iq->debug)
                     reqprintf(iq, "FAILED TO UNPACK");
                 rc = ERR_BADREQ;
-                BACKOUT;
+                GOTOBACKOUT;
             }
 
             loadnullbmp(nulls, sizeof(nulls), addkl.fldnullmap,
@@ -3070,7 +3082,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
                 if (iq->debug)
                     reqprintf(iq, "FAILED TO UNPACK TAG NAME");
                 rc = ERR_BADREQ;
-                BACKOUT;
+                GOTOBACKOUT;
             }
             p_buf_tag_name = iq->p_buf_in;
             iq->p_buf_in += addkl.taglen;
@@ -3081,7 +3093,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
                 if (iq->debug)
                     reqprintf(iq, "FAILED TO UNPACK DATA");
                 rc = ERR_BADREQ;
-                BACKOUT;
+                GOTOBACKOUT;
             }
             p_buf_data = iq->p_buf_in;
             iq->p_buf_in += addkl.reclen;
@@ -3099,7 +3111,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
                                                  &trans, &osql_needtransaction);
                     if (rc) {
                         numerrs = 1;
-                        BACKOUT;
+                        GOTOBACKOUT;
                     }
                 } else {
                     logmsg(LOGMSG_FATAL, 
@@ -3115,7 +3127,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
                 if (rc) {
                     numerrs = 1;
                     err.errcode = ERR_ACCESS;
-                    BACKOUT;
+                    GOTOBACKOUT;
                 }
             }
 
@@ -3165,7 +3177,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
             free_blob_buffers(blobs, MAXBLOBS);
             if (rc != 0) {
                 numerrs = 1;
-                BACKOUT;
+                GOTOBACKOUT;
             }
             /* TODO should this be set to rrn? where did that value come
              * from? */
@@ -3187,7 +3199,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
                 if (iq->debug)
                     reqprintf(iq, "FAILED TO UNPACK");
                 rc = ERR_BADREQ;
-                BACKOUT;
+                GOTOBACKOUT;
             }
 
             /* get the start/end of the data */
@@ -3195,7 +3207,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
                 if (iq->debug)
                     reqprintf(iq, "FAILED TO UNPACK DATA");
                 rc = ERR_BADREQ;
-                BACKOUT;
+                GOTOBACKOUT;
             }
             p_buf_data = iq->p_buf_in;
             iq->p_buf_in += adddta.reclen;
@@ -3218,7 +3230,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
                                                  &trans, &osql_needtransaction);
                     if (rc) {
                         numerrs = 1;
-                        BACKOUT;
+                        GOTOBACKOUT;
                     }
                 } else {
                     logmsg(LOGMSG_FATAL, "%s:%d NULL TRANSACTION!\n", __FILE__,
@@ -3233,7 +3245,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
                 if (rc) {
                     numerrs = 1;
                     err.errcode = ERR_ACCESS;
-                    BACKOUT;
+                    GOTOBACKOUT;
                 }
             }
 
@@ -3246,7 +3258,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
                             RECFLAGS_DYNSCHEMA_NULLS_ONLY, 0);
             if (rc != 0) {
                 numerrs = 1;
-                BACKOUT;
+                GOTOBACKOUT;
             }
             break;
         }
@@ -3260,7 +3272,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
                 if (iq->debug)
                     reqprintf(iq, "FAILED TO UNPACK");
                 rc = ERR_BADREQ;
-                BACKOUT;
+                GOTOBACKOUT;
             }
 
             /* if we got this far, the BLOCK2_ADDDTA should have
@@ -3280,7 +3292,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
                 if (iq->debug)
                     reqprintf(iq, "FAILED TO UNPACK");
                 rc = ERR_BADREQ;
-                BACKOUT;
+                GOTOBACKOUT;
             }
 
             have_keyless_requests = 1;
@@ -3296,7 +3308,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
                                                  &trans, &osql_needtransaction);
                     if (rc) {
                         numerrs = 1;
-                        BACKOUT;
+                        GOTOBACKOUT;
                     }
                 } else {
                     logmsg(LOGMSG_FATAL, "%s:%d NULL TRANSACTION!\n", __FILE__,
@@ -3311,7 +3323,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
                 if (rc) {
                     numerrs = 1;
                     err.errcode = ERR_ACCESS;
-                    BACKOUT;
+                    GOTOBACKOUT;
                 }
             }
 
@@ -3324,7 +3336,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
                             &err.ixnum, hdr.opcode, 0);
             if (rc != 0) {
                 numerrs = 1;
-                BACKOUT;
+                GOTOBACKOUT;
             }
             break;
         }
@@ -3338,7 +3350,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
                 if (iq->debug)
                     reqprintf(iq, "FAILED TO UNPACK");
                 rc = ERR_BADREQ;
-                BACKOUT;
+                GOTOBACKOUT;
             }
 
             rrn = delete.rrn;
@@ -3355,7 +3367,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
                                                  &trans, &osql_needtransaction);
                     if (rc) {
                         numerrs = 1;
-                        BACKOUT;
+                        GOTOBACKOUT;
                     }
                 } else {
                     logmsg(LOGMSG_FATAL, "%s:%d NULL TRANSACTION!\n", __FILE__,
@@ -3370,7 +3382,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
                 if (rc) {
                     numerrs = 1;
                     err.errcode = ERR_ACCESS;
-                    BACKOUT;
+                    GOTOBACKOUT;
                 }
             }
 
@@ -3378,7 +3390,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
                             -1ULL, &err.errcode, &err.ixnum, hdr.opcode, 0);
             if (rc != 0) {
                 numerrs = 1;
-                BACKOUT;
+                GOTOBACKOUT;
             }
             break;
         }
@@ -3394,7 +3406,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
                 if (iq->debug)
                     reqprintf(iq, "FAILED TO UNPACK");
                 rc = ERR_BADREQ;
-                BACKOUT;
+                GOTOBACKOUT;
             }
 
             ixkeylen = getdefaultkeysize(iq->usedb, delkey.ixnum);
@@ -3417,7 +3429,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
                           "invalid index %d or bad key length %d!=%d\n",
                           delkey.ixnum, delkey.keylen, ixkeylen);
                 rc = ERR_BADREQ;
-                BACKOUT;
+                GOTOBACKOUT;
             }
             rrn = delkey.rrn;
 
@@ -3426,7 +3438,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
                 if (iq->debug)
                     reqprintf(iq, "FAILED TO UNPACK KEY");
                 rc = ERR_BADREQ;
-                BACKOUT;
+                GOTOBACKOUT;
             }
 
             char ondisk_tag[MAXTAGLEN], client_tag[MAXTAGLEN];
@@ -3442,7 +3454,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
                 if (iq->debug)
                     reqprintf(iq, "ERR CONVERT IX 0");
                 rc = ERR_CONVERT_IX;
-                BACKOUT;
+                GOTOBACKOUT;
             }
             memcpy(saved_fndkey, key, getkeysize(iq->usedb, delkey.ixnum));
             saved_rrn = rrn;
@@ -3466,7 +3478,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
                 if (iq->debug)
                     reqprintf(iq, "FAILED TO UNPACK");
                 rc = ERR_BADREQ;
-                BACKOUT;
+                GOTOBACKOUT;
             }
 
             loadnullbmp(nulls, sizeof(nulls), updrrnkl.fldnullmap,
@@ -3493,7 +3505,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
                                                  &trans, &osql_needtransaction);
                     if (rc) {
                         numerrs = 1;
-                        BACKOUT;
+                        GOTOBACKOUT;
                     }
                 } else {
                     logmsg(LOGMSG_FATAL, "%s:%d NULL TRANSACTION!\n", __FILE__,
@@ -3508,7 +3520,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
                 if (rc) {
                     numerrs = 1;
                     err.errcode = ERR_ACCESS;
-                    BACKOUT;
+                    GOTOBACKOUT;
                 }
             }
 
@@ -3523,7 +3535,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
             free_blob_buffers(blobs, MAXBLOBS);
             if (rc != 0) {
                 numerrs = 1;
-                BACKOUT;
+                GOTOBACKOUT;
             }
             break;
         }
@@ -3546,7 +3558,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
                 if (iq->debug)
                     reqprintf(iq, "FAILED TO UNPACK");
                 rc = ERR_BADREQ;
-                BACKOUT;
+                GOTOBACKOUT;
             }
 
             /* just like BLOCK_UPVRRN */
@@ -3555,7 +3567,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
                 if (iq->debug)
                     reqprintf(iq, "FAILED TO UNPACK NEW DATA");
                 rc = ERR_BADREQ;
-                BACKOUT;
+                GOTOBACKOUT;
             }
 
             p_buf_data_new = iq->p_buf_in;
@@ -3566,7 +3578,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
                 if (iq->debug)
                     reqprintf(iq, "FAILED TO UNPACK VDATA");
                 rc = ERR_BADREQ;
-                BACKOUT;
+                GOTOBACKOUT;
             }
 
             p_buf_data_v = iq->p_buf_in;
@@ -3578,7 +3590,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
                     reqprintf(iq, "MISMATCH newlen %d != vlen %d", updrrn.rlen,
                               updrrn.vlen);
                 rc = ERR_BADREQ;
-                BACKOUT;
+                GOTOBACKOUT;
             }
 
             p_buf_tag_name = (const uint8_t *)".DEFAULT";
@@ -3597,7 +3609,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
                                                  &trans, &osql_needtransaction);
                     if (rc) {
                         numerrs = 1;
-                        BACKOUT;
+                        GOTOBACKOUT;
                     }
                 } else {
                     logmsg(LOGMSG_FATAL, "%s:%d NULL TRANSACTION!\n", __FILE__,
@@ -3612,7 +3624,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
                 if (rc) {
                     numerrs = 1;
                     err.errcode = ERR_ACCESS;
-                    BACKOUT;
+                    GOTOBACKOUT;
                 }
             }
 
@@ -3631,7 +3643,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
 
             if (rc != 0) {
                 numerrs = 1;
-                BACKOUT;
+                GOTOBACKOUT;
             }
 
             break;
@@ -3652,7 +3664,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
                 if (iq->debug)
                     reqprintf(iq, "FAILED TO UNPACK");
                 rc = ERR_BADREQ;
-                BACKOUT;
+                GOTOBACKOUT;
             }
 
             /*ADD RRN AND IX 0 KEY */
@@ -3670,7 +3682,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
                 if (iq->debug)
                     reqprintf(iq, "FAILED TO UNPACK DATA");
                 rc = ERR_BADREQ;
-                BACKOUT;
+                GOTOBACKOUT;
             }
 
             /* increment the input pointer past the record */
@@ -3694,7 +3706,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
                                                  &trans, &osql_needtransaction);
                     if (rc) {
                         numerrs = 1;
-                        BACKOUT;
+                        GOTOBACKOUT;
                     }
                 } else {
                     logmsg(LOGMSG_FATAL, "%s:%d NULL TRANSACTION!\n", __FILE__,
@@ -3709,7 +3721,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
                 if (rc) {
                     numerrs = 1;
                     err.errcode = ERR_ACCESS;
-                    BACKOUT;
+                    GOTOBACKOUT;
                 }
             }
 
@@ -3724,7 +3736,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
 
             if (rc != 0) {
                 numerrs = 1;
-                BACKOUT;
+                GOTOBACKOUT;
             }
 
             break;
@@ -3750,7 +3762,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
                 if (iq->debug)
                     reqprintf(iq, "FAILED TO UNPACK DATA");
                 rc = ERR_BADREQ;
-                BACKOUT;
+                GOTOBACKOUT;
             }
 
             ixnum = addsec.ixnum;
@@ -3774,7 +3786,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
                 if (iq->debug)
                     reqprintf(iq, "FAILED TO UNPACK DATA");
                 rc = ERR_BADREQ;
-                BACKOUT;
+                GOTOBACKOUT;
             }
 
             ixkeylen = getkeysize(iq->usedb, 0);
@@ -3784,7 +3796,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
                 if (iq->debug)
                     reqprintf(iq, "FAILED TO UNPACK DATA");
                 rc = ERR_BADREQ;
-                BACKOUT;
+                GOTOBACKOUT;
             }
             p_keydat = (const char *)iq->p_buf_in;
             iq->p_buf_in += ixkeylen;
@@ -3800,7 +3812,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
                                                  &trans, &osql_needtransaction);
                     if (rc) {
                         numerrs = 1;
-                        BACKOUT;
+                        GOTOBACKOUT;
                     }
                 } else {
                     logmsg(LOGMSG_FATAL, "%s:%d NULL TRANSACTION!\n", __FILE__,
@@ -3818,13 +3830,13 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
                 if (iq->debug)
                     reqprintf(iq, "ERR CLIENT CONVERT IX 0 RRN %d", rrn);
                 rc = ERR_CONVERT_IX;
-                BACKOUT;
+                GOTOBACKOUT;
             }
             rc = del_record(iq, trans, key, delsc.rrn, 0, /*genid*/
                             -1ULL, &err.errcode, &err.ixnum, hdr.opcode, 0);
             if (rc != 0) {
                 numerrs = 1;
-                BACKOUT;
+                GOTOBACKOUT;
             }
             break;
         }
@@ -3842,7 +3854,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
                     reqprintf(iq, "FAILED TO UNPACK DATA");
                 rc = ERR_BADREQ;
 
-                BACKOUT;
+                GOTOBACKOUT;
             }
 
             ixnum = delsec.ixnum;
@@ -3852,7 +3864,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
                     reqprintf(iq, "BAD IX %d", ixnum);
                 reqerrstr(iq, COMDB2_DEL_RC_INVL_IDX, "bad index %d", ixnum);
                 rc = ERR_BADREQ;
-                BACKOUT;
+                GOTOBACKOUT;
             }
 
             /* handled in BLOCK_DELSC */
@@ -3881,7 +3893,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
                     reqprintf(iq, "FAILED TO UNPACK DATA");
                 rc = ERR_BADREQ;
 
-                BACKOUT;
+                GOTOBACKOUT;
             }
 
             rrn = upvrrn.rrn;
@@ -3893,7 +3905,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
                     reqprintf(iq, "FAILED TO UNPACK DATA");
                 rc = ERR_BADREQ;
 
-                BACKOUT;
+                GOTOBACKOUT;
             }
 
             iq->p_buf_in += vlen;
@@ -3905,7 +3917,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
                     reqprintf(iq, "FAILED TO UNPACK DATA");
                 rc = ERR_BADREQ;
 
-                BACKOUT;
+                GOTOBACKOUT;
             }
 
             newlen *= 4;
@@ -3917,7 +3929,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
                     reqprintf(iq, "FAILED TO UNPACK DATA");
                 rc = ERR_BADREQ;
 
-                BACKOUT;
+                GOTOBACKOUT;
             }
 
             iq->p_buf_in += newlen;
@@ -3964,7 +3976,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
                                                  &trans, &osql_needtransaction);
                     if (rc) {
                         numerrs = 1;
-                        BACKOUT;
+                        GOTOBACKOUT;
                     }
                 } else {
                     logmsg(LOGMSG_FATAL, "%s:%d NULL TRANSACTION!\n", __FILE__,
@@ -3979,7 +3991,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
                 if (rc) {
                     numerrs = 1;
                     err.errcode = ERR_ACCESS;
-                    BACKOUT;
+                    GOTOBACKOUT;
                 }
             }
 
@@ -3998,7 +4010,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
 
             if (rc != 0) {
                 numerrs = 1;
-                BACKOUT;
+                GOTOBACKOUT;
             }
             break;
         }
@@ -4019,7 +4031,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
                 if (iq->debug)
                     reqprintf(iq, "FAILED TO UNPACK");
                 rc = ERR_BADREQ;
-                BACKOUT;
+                GOTOBACKOUT;
             }
 
             iq->usedb = getdbbynum(use.dbnum);
@@ -4034,7 +4046,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
                           use.dbnum);
                 iq->usedb = iq->origdb;
                 rc = ERR_BADREQ;
-                BACKOUT;
+                GOTOBACKOUT;
             }
             if (iq->debug)
                 reqprintf(iq, "DB NUM %d '%s'", use.dbnum,
@@ -4052,7 +4064,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
                 if (iq->debug)
                     reqprintf(iq, "FAILED TO UNPACK");
                 rc = ERR_BADREQ;
-                BACKOUT;
+                GOTOBACKOUT;
             }
 
             if (usekl.taglen) {
@@ -4062,7 +4074,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
                     if (iq->debug)
                         reqprintf(iq, "INVALID TAGLEN %d", usekl.taglen);
                     rc = ERR_BADREQ;
-                    BACKOUT;
+                    GOTOBACKOUT;
                 }
 
                 bzero(tbltag, sizeof(tbltag));
@@ -4074,7 +4086,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
                     if (iq->debug)
                         reqprintf(iq, "FAILED TO UNPACK TBLTAG");
                     rc = ERR_BADREQ;
-                    BACKOUT;
+                    GOTOBACKOUT;
                 }
 
                 iq->usedb = get_dbtable_by_name(tbltag);
@@ -4084,7 +4096,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
                         reqprintf(iq, "ERROR UNKNOWN TABLE '%s'", tbltag);
                     reqerrstr(iq, COMDB2_BLK_RC_UNKN_TAG,
                               "error unknown table '%s'", tbltag);
-                    BACKOUT;
+                    GOTOBACKOUT;
                 }
 
                 if (iq->debug)
@@ -4098,7 +4110,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
                               "error unknown db num %d", usekl.dbnum);
                     iq->usedb = iq->origdb;
                     rc = ERR_BADREQ;
-                    BACKOUT;
+                    GOTOBACKOUT;
                 }
                 if (iq->debug)
                     reqprintf(iq, "DB NUM %d '%s'", usekl.dbnum,
@@ -4115,7 +4127,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
                 if (iq->debug)
                     reqprintf(iq, "FAILED TO UNPACK");
                 rc = ERR_BADREQ;
-                BACKOUT;
+                GOTOBACKOUT;
             }
 
             if (!(iq->p_buf_in =
@@ -4124,7 +4136,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
                 if (iq->debug)
                     reqprintf(iq, "FAILED TO UNPACK TZ");
                 rc = ERR_BADREQ;
-                BACKOUT;
+                GOTOBACKOUT;
             }
 
             break;
@@ -4140,7 +4152,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
                 if (iq->debug)
                     reqprintf(iq, "FAILED TO UNPACK");
                 rc = ERR_BADREQ;
-                BACKOUT;
+                GOTOBACKOUT;
             }
 
             if (qblob.blobno >= MAXBLOBS) {
@@ -4148,7 +4160,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
                           "blob %d out of range (MAXBLOBS is %d)", qblob.blobno,
                           MAXBLOBS);
                 rc = ERR_BADREQ;
-                BACKOUT;
+                GOTOBACKOUT;
             } else {
                 blob_buffer_t *blob = &blobs[qblob.blobno];
                 if (!blob->exists) {
@@ -4157,7 +4169,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
                                   "blob %d too large (%u > max size %u)",
                                   qblob.blobno, qblob.length, MAXBLOBLENGTH);
                         rc = ERR_BLOB_TOO_LARGE;
-                        BACKOUT;
+                        GOTOBACKOUT;
                     }
                     blob->length = qblob.length;
                     blob->collected = 0;
@@ -4174,7 +4186,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
                             reqerrstr(iq, COMDB2_BLOB_RC_ALLOC,
                                       "malloc failed");
                             rc = ERR_INTERNAL;
-                            BACKOUT;
+                            GOTOBACKOUT;
                         }
                     }
                     blob->exists = 1;
@@ -4184,22 +4196,22 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
                 } else if (qblob.length != blob->length) {
                     reqerrstr(iq, COMDB2_BLOB_RC_RCV_BAD_LENGTH,
                               "bad fragment for blob %d gives length %u "
-                              "expected %u",
+                              "expected %zu",
                               qblob.blobno, qblob.length, blob->length);
                     rc = ERR_BADREQ;
-                    BACKOUT;
+                    GOTOBACKOUT;
                 }
                 /* collect more data */
                 if (qblob.frag_len > 0) {
                     if (qblob.frag_len + blob->collected > blob->length) {
                         reqerrstr(iq, COMDB2_BLOB_RC_RCV_TOO_MUCH,
                                   "received too much data for blob %d "
-                                  "(I had %u/%u bytes, received another "
+                                  "(I had %zu/%zu bytes, received another "
                                   "%u)",
                                   qblob.blobno, blob->collected, blob->length,
                                   qblob.frag_len);
                         rc = ERR_BADREQ;
-                        BACKOUT;
+                        GOTOBACKOUT;
                     }
                     iq->p_buf_in = buf_no_net_get(blob->data + blob->collected,
                                                   qblob.frag_len, iq->p_buf_in,
@@ -4220,7 +4232,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
                 if (iq->debug)
                     reqprintf(iq, "FAILED TO UNPACK");
                 rc = ERR_BADREQ;
-                BACKOUT;
+                GOTOBACKOUT;
             }
 
             have_keyless_requests = 1;
@@ -4237,7 +4249,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
                                                  &trans, &osql_needtransaction);
                     if (rc) {
                         numerrs = 1;
-                        BACKOUT;
+                        GOTOBACKOUT;
                     }
                 } else {
                     logmsg(LOGMSG_FATAL, "%s:%d NULL TRANSACTION!\n", __FILE__,
@@ -4249,7 +4261,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
             rc = block2_qadd(iq, p_blkstate, trans, &qadd, blobs);
             free_blob_buffers(blobs, MAXBLOBS);
             if (rc != 0)
-                BACKOUT;
+                GOTOBACKOUT;
             break;
         }
         case BLOCK_SETFLAGS: {
@@ -4260,7 +4272,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
                 if (iq->debug)
                     reqprintf(iq, "FAILED TO UNPACK");
                 rc = ERR_BADREQ;
-                BACKOUT;
+                GOTOBACKOUT;
             }
             iq->transflags = p_setflags.flags;
             break;
@@ -4275,14 +4287,14 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
                 if (iq->debug)
                     reqprintf(iq, "FAILED TO UNPACK");
                 rc = ERR_BADREQ;
-                BACKOUT;
+                GOTOBACKOUT;
             }
 
             /* A Java stored procedure custom operation. */
             rc = block2_custom(iq, &p_custom, iq->p_buf_in, blobs);
             free_blob_buffers(blobs, MAXBLOBS);
             if (rc != 0)
-                BACKOUT;
+                GOTOBACKOUT;
             break;
         }
 
@@ -4301,7 +4313,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
             if (iq && iq->usedb && iq->usedb->odh) {
                 reqprintf(iq, "ERROR - OPCODE BLOCK2_DELOLDER FOR ODH TABLE");
                 rc = ERR_BADREQ;
-                BACKOUT;
+                GOTOBACKOUT;
             }
 
             ++delayed;
@@ -4310,7 +4322,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
                 if (iq->debug)
                     reqprintf(iq, "FAILED TO UNPACK");
                 rc = ERR_BADREQ;
-                BACKOUT;
+                GOTOBACKOUT;
             }
 
             if (!gbl_dtastripe) {
@@ -4331,7 +4343,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
                                                  &trans, &osql_needtransaction);
                     if (rc) {
                         numerrs = 1;
-                        BACKOUT;
+                        GOTOBACKOUT;
                     }
                 } else {
                     logmsg(LOGMSG_FATAL, "%s:%d NULL TRANSACTION!\n", __FILE__,
@@ -4350,7 +4362,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
                     if (rc) {
                         numerrs = 1;
                         err.errcode = ERR_ACCESS;
-                        BACKOUT;
+                        GOTOBACKOUT;
                     }
                 }
 
@@ -4401,14 +4413,14 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
                 if (iq->debug)
                     reqprintf(iq, "FAILED TO UNPACK");
                 rc = ERR_BADREQ;
-                BACKOUT;
+                GOTOBACKOUT;
             }
 
             if (sql.sqlqlen > (p_blkstate->p_buf_next_start - iq->p_buf_in)) {
                 if (iq->debug)
                     reqprintf(iq, "FAILED TO UNPACK SQLQ");
                 rc = ERR_BADREQ;
-                BACKOUT;
+                GOTOBACKOUT;
             }
 
             p_buf_sqlq = iq->p_buf_in;
@@ -4441,7 +4453,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
                         &osql_needtransaction);
                     if (rc) {
                         numerrs = 1;
-                        BACKOUT;
+                        GOTOBACKOUT;
                     }
                 }
             }
@@ -4458,7 +4470,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
                 if (iq->debug)
                     reqprintf(iq, "FAILED TO UNPACK");
                 rc = ERR_BADREQ;
-                BACKOUT;
+                GOTOBACKOUT;
             }
             iq->blkstate->modnum = modnum.modnum;
             break;
@@ -4479,7 +4491,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
                 if (iq->debug)
                     reqprintf(iq, "FAILED TO UNPACK");
                 rc = ERR_BADREQ;
-                BACKOUT;
+                GOTOBACKOUT;
             }
 
             break;
@@ -4493,7 +4505,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
                 if (iq->debug)
                     reqprintf(iq, "FAILED TO UNPACK DBGLOG COOKIE");
                 rc = ERR_BADREQ;
-                BACKOUT;
+                GOTOBACKOUT;
             }
 
             switch (cookie.op) {
@@ -4516,7 +4528,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
                 if (iq->debug)
                     reqprintf(iq, "FAILED TO UNPACK PRAGMA BLOCKOP");
                 rc = ERR_BADREQ;
-                BACKOUT;
+                GOTOBACKOUT;
             }
 
             if (pragma.type == SQL_PRAGMA_MAXCOST) {
@@ -4532,7 +4544,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
                         reqprintf(iq,
                                   "FAILED TO UNPACK SQL_PRAGMA_MAXCOST PRAGMA");
                     rc = ERR_BADREQ;
-                    BACKOUT;
+                    GOTOBACKOUT;
                 }
 
                 if (req.have_max_cost) {
@@ -4566,7 +4578,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
                         reqprintf(
                             iq, "FAILED TO UNPACK TAGGED_CLIENT_ENDIAN PRAGMA");
                     rc = ERR_BADREQ;
-                    BACKOUT;
+                    GOTOBACKOUT;
                 }
                 /* Set ireq for big-endian. */
                 if (TAGGED_API_BIG_ENDIAN == req.endian) {
@@ -4583,7 +4595,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
                     if (iq->debug)
                         reqprintf(iq, "INVALID TAGGED_CLIENT_ENDIAN PRAGMA");
                     rc = ERR_BADREQ;
-                    BACKOUT;
+                    GOTOBACKOUT;
                 }
             }
 
@@ -4599,14 +4611,14 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
                 if (iq->debug)
                     reqprintf(iq, "FAILED TO UNPACK");
                 rc = ERR_BADREQ;
-                BACKOUT;
+                GOTOBACKOUT;
             }
 
             if (iq->usedb == NULL) {
                 if (iq->debug)
                     reqprintf(iq, "NO USEDB PROVIDED");
                 rc = ERR_BADREQ;
-                BACKOUT;
+                GOTOBACKOUT;
             }
 
             // if upgrade-ahead more than 1 record, start a table upgrade
@@ -4616,7 +4628,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
                 rc = start_table_upgrade(iq->dbenv, iq->usedb->tablename,
                                          uptbl.genid, 0, uptbl.nrecs, 1);
                 if (rc != 0)
-                    BACKOUT;
+                    GOTOBACKOUT;
             } else {
                 dtasz = getdatsize(iq->usedb);
                 rc = upgrade_record(iq, trans, uptbl.genid, NULL,
@@ -4635,7 +4647,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
                 reqprintf(iq, "BAD OPCODE %d", hdr.opcode);
             reqerrstr(iq, COMDB2_BLK_RC_UNKN_OP, "bad opcode %d", hdr.opcode);
             rc = ERR_BADREQ;
-            BACKOUT;
+            GOTOBACKOUT;
         } /*switch opcode */
     }     /* BLOCK PROCESSOR FOR LOOP */
 
@@ -4661,7 +4673,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
                                                 &trans, &osql_needtransaction);
                 if (iirc) {
                     numerrs = 1;
-                    BACKOUT;
+                    GOTOBACKOUT;
                 }
             }
             iirc = osql_bplog_schemachange(iq);
@@ -4680,7 +4692,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
                 if (!rc)
                     rc = iirc;
                 numerrs = 1;
-                BACKOUT;
+                GOTOBACKOUT;
             }
 
             /* at this point we have a transaction, which would prevent a
@@ -4689,7 +4701,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
             if (thedb->master != gbl_mynode) {
                 numerrs = 1;
                 rc = ERR_NOMASTER; /*this is what bdb readonly error gets us */
-                BACKOUT;
+                GOTOBACKOUT;
             }
         }
 
@@ -4702,14 +4714,14 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
                     if (rc != RC_INTERNAL_RETRY)
                         logmsg(LOGMSG_ERROR,
                                "get_next_seqno unexpected rc %d\n", rc);
-                    BACKOUT;
+                    GOTOBACKOUT;
                 }
                 p_blkstate->seqno = seqno;
             }
         }
 
         if (needbackout) {
-            BACKOUT;
+            GOTOBACKOUT;
         }
 
         /*numerrs should be 0 for osql mode, since no
@@ -4717,6 +4729,10 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
         if (gbl_prefault_udp)
             send_prefault_udp = 1;
         rc = osql_bplog_commit(iq, trans, &tmpnops, &err);
+        if (rc == ERR_VERIFY) {
+            check_serializability = 1;
+            force_serial_error = 1;
+        }
         send_prefault_udp = 0;
 
         if (iq->osql_step_ix) {
@@ -4742,7 +4758,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
 
         if (rc) {
             numerrs = 1;
-            BACKOUT;
+            GOTOBACKOUT;
         } else {
             nops += tmpnops;
             iq->sorese.nops = nops;
@@ -4750,10 +4766,8 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
     }
 
     /* clear prefixes */
-    if (iq->debug) {
+    if (iq->debug)
         reqpopprefixes(iq, -1);
-        reqpushprefixf(iq, "%p:", trans);
-    }
 
     /* do all previously not done ADD key ops here--they were delayed due
      * to necessity of constraint checks */
@@ -4762,12 +4776,30 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
     ixout = -1;
     errout = 0;
 
-    if (delayed || gbl_goslow) {
+    if (delayed || gbl_goslow || gbl_reorder_idx_writes) {
 
-        if (iq->debug) {
-            reqpushprefixf(iq, "%p:", trans);
-            reqpushprefixf(iq, "delayed_key_adds:");
+        if (gbl_reorder_idx_writes) {
+            if (iq->debug)
+                reqpushprefixf(iq, "process_defered_table:");
+            rc = process_defered_table(iq, p_blkstate, trans, &blkpos, &ixout,
+                                       &errout);
+            if (iq->debug)
+                reqpopprefixes(iq, 1);
+
+            if (rc != 0) {
+                opnum = blkpos; /* so we report the failed blockop accurately */
+                err.blockop_num = blkpos;
+                err.errcode = errout;
+                err.ixnum = ixout;
+                numerrs = 1;
+                reqlog_set_error(iq->reqlogger, "Process Defered Table", rc);
+                GOTOBACKOUT;
+            }
         }
+
+        if (iq->debug)
+            reqpushprefixf(iq, "delayed_key_adds: %p", trans);
+
         int verror = 0;
         rc = delayed_key_adds(iq, p_blkstate, trans, &blkpos, &ixout, &errout);
 
@@ -4775,52 +4807,53 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
             reqpopprefixes(iq, 1);
 
         if (rc != 0) {
-            constraint_violation = 1;
+            check_serializability = 1;
             opnum = blkpos; /* so we report the failed blockop accurately */
             err.blockop_num = blkpos;
             err.errcode = errout;
             err.ixnum = ixout;
             numerrs = 1;
             reqlog_set_error(iq->reqlogger, "Delayed Key Adds", rc);
-            BACKOUT;
+            GOTOBACKOUT;
         }
 
         /* check foreign key constraints */
-        verror = 0;
 
-        rc = verify_del_constraints(javasp_trans_handle, iq, p_blkstate, trans,
-                                    blobs, &verror);
+        if (iq->debug)
+            reqpushprefixf(iq, "verify_del_constraints: %p", trans);
+        rc = verify_del_constraints(iq, p_blkstate, trans, blobs, &verror);
         if (iq->debug)
             reqpopprefixes(iq, 1);
+
         if (rc != 0) {
-            constraint_violation = 1;
+            check_serializability = 1;
             err.blockop_num = 0;
             err.errcode = verror;
             err.ixnum = -1;
             numerrs = 1;
             reqlog_set_error(iq->reqlogger, "Verify Del Constraints", rc);
-            BACKOUT;
+            GOTOBACKOUT;
         }
-        if (iq->debug)
-            reqpushprefixf(iq, "%p:", trans);
 
-        rc = verify_add_constraints(javasp_trans_handle, iq, p_blkstate, trans,
-                                    &verror);
+        if (iq->debug)
+            reqpushprefixf(iq, "verify_add_constraints: %p", trans);
+
+        rc = verify_add_constraints(iq, p_blkstate, trans, &verror);
         if (iq->debug)
             reqpopprefixes(iq, 1);
+
         if (rc != 0) {
-            constraint_violation = 1;
+            check_serializability = 1;
             err.blockop_num = 0;
             err.errcode = verror;
             err.ixnum = -1;
             numerrs = 1;
             reqlog_set_error(iq->reqlogger, "Verify Add Constraints", rc);
-            BACKOUT;
+            GOTOBACKOUT;
         }
 
     } /* end delayed */
     else {
-        extern unsigned int gbl_delayed_skip;
         ++gbl_delayed_skip;
     }
 
@@ -4839,7 +4872,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
 
             rc = get_next_seqno(trans, &seqno);
             if (rc)
-                BACKOUT;
+                GOTOBACKOUT;
 
             init_fake_ireq(thedb, &aiq);
             aiq.jsph = iq->jsph;
@@ -4850,19 +4883,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
             rc = add_oplog_entry(iq, trans, LCL_OP_COMMIT, NULL, 0);
         }
         if (rc)
-            BACKOUT;
-    }
-
-    /* Trigger JAVASP_TRANS_LISTEN_BEFORE_COMMIT. */
-    thrman_wheref(thr_self, "%s [javasp pre commit hooks]", req2a(iq->opcode));
-    rc = javasp_trans_misc_trigger(javasp_trans_handle,
-                                   JAVASP_TRANS_LISTEN_BEFORE_COMMIT);
-    if (rc != 0) {
-        err.blockop_num = 0;
-        err.errcode = OP_FAILED_INTERNAL + ERR_JAVASP_ABORT_OP;
-        err.ixnum = -1;
-        numerrs = 1;
-        BACKOUT;
+            GOTOBACKOUT;
     }
 
     Pthread_rwlock_rdlock(&commit_lock);
@@ -4873,6 +4894,7 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
         Pthread_rwlock_wrlock(&commit_lock);
         hascommitlock = 1;
 
+        /* This is looking for a commit record - one dive is fine */
         while ((iq->arr &&
                 bdb_osql_serial_check(thedb->bdb_env, iq->arr, &(iq->arr->file),
                                       &(iq->arr->offset), 1)) ||
@@ -4882,19 +4904,11 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
                                       &(iq->selectv_arr->offset), 1))) {
             Pthread_rwlock_unlock(&commit_lock);
             hascommitlock = 0;
-            if (iq->arr &&
-                bdb_osql_serial_check(thedb->bdb_env, iq->arr, &(iq->arr->file),
-                                      &(iq->arr->offset), 0)) {
-                currangearr_free(iq->arr);
-                iq->arr = NULL;
-                numerrs = 1;
-                rc = ERR_NOTSERIAL;
-                reqerrstr(iq, ERR_NOTSERIAL, "transaction is not serializable");
-                BACKOUT;
-            } else if (iq->selectv_arr &&
-                       bdb_osql_serial_check(thedb->bdb_env, iq->selectv_arr,
-                                             &(iq->selectv_arr->file),
-                                             &(iq->selectv_arr->offset), 0)) {
+
+            if (iq->selectv_arr &&
+                bdb_osql_serial_check(thedb->bdb_env, iq->selectv_arr,
+                                      &(iq->selectv_arr->file),
+                                      &(iq->selectv_arr->offset), 0)) {
                 currangearr_free(iq->selectv_arr);
                 iq->selectv_arr = NULL;
                 numerrs = 1;
@@ -4905,7 +4919,20 @@ static int toblock_main_int(struct javasp_trans_state *javasp_trans_handle,
 
                 rc = ERR_CONSTR;
                 reqerrstr(iq, COMDB2_CSTRT_RC_INVL_REC, "selectv constraints");
-                BACKOUT;
+                GOTOBACKOUT;
+            } else if (iq->arr && bdb_osql_serial_check(
+                                      thedb->bdb_env, iq->arr, &(iq->arr->file),
+                                      &(iq->arr->offset), 0)) {
+                currangearr_free(iq->arr);
+                iq->arr = NULL;
+                numerrs = 1;
+                rc = ERR_NOTSERIAL;
+
+                /* Check selectv_arr in backout code */
+                if (iq->selectv_arr)
+                    check_serializability = 1;
+                reqerrstr(iq, ERR_NOTSERIAL, "transaction is not serializable");
+                GOTOBACKOUT;
             } else {
                 Pthread_rwlock_wrlock(&commit_lock);
                 hascommitlock = 1;
@@ -5069,14 +5096,35 @@ backout:
      * serializable error and a dup-key constraint we should return the 
      * serializable error as the dup-key may have been caused by the 
      * conflicting write. */
-    if (constraint_violation && iq->arr &&
-        bdb_osql_serial_check(thedb->bdb_env, iq->arr, &(iq->arr->file),
-                &(iq->arr->offset), 0)) {
-        currangearr_free(iq->arr);
-        iq->arr = NULL;
-        numerrs = 1;
-        rc = ERR_NOTSERIAL;
-        reqerrstr(iq, ERR_NOTSERIAL, "transaction is not serializable");
+    if (check_serializability) {
+        /* Check serial and selectv readsets independently, serial first to
+         * eliminate the race: selectv-error should override serial error */
+        if (iq->arr && (force_serial_error ||
+                               bdb_osql_serial_check(thedb->bdb_env, iq->arr,
+                                                     &(iq->arr->file),
+                                                     &(iq->arr->offset), 0))) {
+            numerrs = 1;
+            currangearr_free(iq->arr);
+            iq->arr = NULL;
+            rc = ERR_NOTSERIAL;
+            reqerrstr(iq, ERR_NOTSERIAL, "transaction is not serializable");
+        }
+
+        if (iq->selectv_arr &&
+            bdb_osql_serial_check(thedb->bdb_env, iq->selectv_arr,
+                                  &(iq->selectv_arr->file),
+                                  &(iq->selectv_arr->offset), 0)) {
+            numerrs = 1;
+            currangearr_free(iq->selectv_arr);
+            iq->selectv_arr = NULL;
+
+            /* verify error */
+            err.ixnum = -1; /* data */
+            err.errcode = ERR_CONSTR;
+
+            rc = ERR_CONSTR;
+            reqerrstr(iq, COMDB2_CSTRT_RC_INVL_REC, "selectv constraints");
+        } 
     }
 
     /* starting writes, no more reads */
@@ -5105,13 +5153,15 @@ backout:
             int priority = 0;
 
             if (iq->tranddl) {
-                irc = trans_abort(iq, iq->sc_tran);
-                if (irc != 0) {
-                    logmsg(LOGMSG_FATAL, "%s:%d TRANS_ABORT FAILED RC %d",
-                           __func__, __LINE__, irc);
-                    comdb2_die(1);
+                if (iq->sc_tran) {
+                    irc = trans_abort(iq, iq->sc_tran);
+                    if (irc != 0) {
+                        logmsg(LOGMSG_FATAL, "%s:%d TRANS_ABORT FAILED RC %d",
+                               __func__, __LINE__, irc);
+                        comdb2_die(1);
+                    }
+                    iq->sc_tran = NULL;
                 }
-                iq->sc_tran = NULL;
 
                 /* Backout Schema Change */
                 if (!parent_trans)
@@ -5469,9 +5519,11 @@ add_blkseq:
         memcpy(p_buf_fstblk, &t, sizeof(int));
 
         if (!rowlocks) {
-            // if RC_INTERNAL_RETRY && replicant_can_retry don't add to blkseq
-            if (outrc == ERR_BLOCK_FAILED && err.errcode == ERR_VERIFY &&
-                (iq->have_snap_info && iq->snap_info.replicant_can_retry)) {
+            // if VERIFY-ERROR && replicant_is_able_to_retry don't add to blkseq
+            if ((outrc == ERR_NOTSERIAL ||
+                 (outrc == ERR_BLOCK_FAILED && err.errcode == ERR_VERIFY)) &&
+                (iq->have_snap_info &&
+                 iq->snap_info.replicant_is_able_to_retry)) {
                 /* do nothing */
             } else {
                 rc = bdb_blkseq_insert(thedb->bdb_env, parent_trans, bskey,
@@ -5803,13 +5855,7 @@ add_blkseq:
     n_commits++;
     Pthread_mutex_unlock(&commit_stat_lk);
 
-    /* Trigger JAVASP_TRANS_LISTEN_AFTER_COMMIT.  Doesn't really matter what
-     * it does since the transaction is committed. */
     if (outrc == 0) {
-        thrman_wheref(thr_self, "%s [javasp post commit]", req2a(iq->opcode));
-        javasp_trans_misc_trigger(javasp_trans_handle,
-                                  JAVASP_TRANS_LISTEN_AFTER_COMMIT);
-
         if (iq->__limits.maxcost_warn &&
             (iq->cost > iq->__limits.maxcost_warn)) {
             logmsg(LOGMSG_WARN, "[%s] warning: transaction exceeded cost threshold "
@@ -5818,6 +5864,7 @@ add_blkseq:
         }
     }
 
+    fromline = __LINE__;
 cleanup:
     logmsg(LOGMSG_DEBUG, "%s cleanup did_replay:%d fromline:%d\n", __func__,
            did_replay, fromline);
@@ -5861,18 +5908,18 @@ static uint64_t block_processor_ms = 0;
 static int toblock_main(struct javasp_trans_state *javasp_trans_handle,
                         struct ireq *iq, block_state_t *p_blkstate)
 {
-    int now, rc, prcnt = 0, prmax = 0;
-    uint64_t start, end;
-    extern int gbl_print_blockp_stats;
+    int rc, prcnt = 0, prmax = 0;
     static pthread_mutex_t blklk = PTHREAD_MUTEX_INITIALIZER;
-    static int blkcnt = 0, lastpr = 0;
+    static int blkcnt = 0;
+    static uint64_t lastpr = 0;
+
+    uint64_t start = gettimeofday_ms();
 
     Pthread_mutex_lock(&blklk);
     blkcnt++;
-
-    if (((now = comdb2_time_epoch()) - lastpr) > 1) {
+    if (start - lastpr > 1000) {
         prcnt = blkcnt;
-        lastpr = now;
+        lastpr = start;
     }
 
     if (blkcnt > blkmax)
@@ -5883,13 +5930,13 @@ static int toblock_main(struct javasp_trans_state *javasp_trans_handle,
     Pthread_mutex_unlock(&blklk);
 
     if (prcnt && gbl_print_blockp_stats) {
-        logmsg(LOGMSG_USER, "%d threads are in the block processor, max is %d\n",
-                prcnt, prmax);
+        logmsg(LOGMSG_USER,
+               "%d threads are in the block processor, max is %d\n", prcnt,
+               prmax);
     }
 
-    start = gettimeofday_ms();
     rc = toblock_main_int(javasp_trans_handle, iq, p_blkstate);
-    end = gettimeofday_ms();
+    uint64_t end = gettimeofday_ms();
 
     if (rc == 0) {
         osql_postcommit_handle(iq);

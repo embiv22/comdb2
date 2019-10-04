@@ -148,8 +148,8 @@ static int systblTablesFilter(
   int argc, sqlite3_value **argv
 ){
   systbl_tables_cursor *pCur = (systbl_tables_cursor*)pVtabCursor;
-
   pCur->iRowid = 0;
+  comdb2_next_allowed_table(&pCur->iRowid);
   return SQLITE_OK;
 }
 
@@ -191,12 +191,8 @@ const sqlite3_module systblTablesModule = {
   0,                         /* xShadowName */
 };
 
-#endif /* (!defined(SQLITE_CORE) || defined(SQLITE_BUILDING_FOR_COMDB2)) \
-          && !defined(SQLITE_OMIT_VIRTUALTABLE) */
-
 /* This initializes this table but also a bunch of other schema tables
 ** that fall under the similar use. */
-#ifdef SQLITE_BUILDING_FOR_COMDB2
 extern int sqlite3CompletionVtabInit(sqlite3 *);
 
 int comdb2SystblInit(
@@ -247,12 +243,6 @@ int comdb2SystblInit(
   if (rc == SQLITE_OK)
     rc = sqlite3_create_module(db, "comdb2_clientstats", &systblClientStatsModule, 0);
   if (rc == SQLITE_OK)
-    rc = sqlite3_create_module(db, "comdb2_timepartitions", &systblTimepartModule, 0);
-  if (rc == SQLITE_OK)
-    rc = sqlite3_create_module(db, "comdb2_timepartshards", &systblTimepartShardsModule, 0);
-  if (rc == SQLITE_OK)
-    rc = sqlite3_create_module(db, "comdb2_timepartevents", &systblTimepartEventsModule, 0);
-  if (rc == SQLITE_OK)
     rc = sqlite3_create_module(db, "comdb2_transaction_logs", &systblTransactionLogsModule, 0);
   if (rc == SQLITE_OK)
     rc = sqlite3_create_module(db, "comdb2_metrics", &systblMetricsModule, 0);
@@ -264,6 +254,10 @@ int comdb2SystblInit(
     rc = sqlite3_create_module(db, "comdb2_logical_operations", &systblLogicalOpsModule, 0);
   if (rc == SQLITE_OK)
     rc = sqlite3_create_module(db, "comdb2_systables", &systblSystabsModule, 0);
+  if (rc == SQLITE_OK)
+    rc = systblTimepartInit(db);
+  if (rc == SQLITE_OK)
+    rc = systblCronInit(db);
   if (rc == SQLITE_OK)
     rc = systblTypeSamplesInit(db);
   if (rc == SQLITE_OK)
@@ -277,12 +271,21 @@ int comdb2SystblInit(
   if (rc == SQLITE_OK)
     rc = systblClusterInit(db);
   if (rc == SQLITE_OK)
-      rc = systblActiveOsqlsInit(db);
+    rc = systblActiveOsqlsInit(db);
   if (rc == SQLITE_OK)
-      rc = systblBlkseqInit(db);
+    rc = systblBlkseqInit(db);
   if (rc == SQLITE_OK)
-      rc = systblFingerprintsInit(db);
+    rc = systblFingerprintsInit(db);
+  if (rc == SQLITE_OK)
+    rc = systblScStatusInit(db);
+  if (rc == SQLITE_OK)
+    rc = systblConnectionsInit(db);
+  if (rc == SQLITE_OK)
+    rc = systblViewsInit(db);
+  if (rc == SQLITE_OK)
+    rc  = systblSQLClientStats(db);
 #endif
   return rc;
 }
-#endif /* SQLITE_BUILDING_FOR_COMDB2 */
+#endif /* (!defined(SQLITE_CORE) || defined(SQLITE_BUILDING_FOR_COMDB2)) \
+          && !defined(SQLITE_OMIT_VIRTUALTABLE) */

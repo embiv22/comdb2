@@ -655,27 +655,24 @@ static int bdb_fetch_int_ll(
             return -1;
         }
 
-        if (return_dta)
-            *reqdtalen = 0;
-
         ixlen_full = sizeof(unsigned long long); /* len of a gmonid */
         keycontainsgenid = 0;
         ixrecnum = 0;
         lookahead = 0;
         dbp = NULL; /* will be set later */
-    } else          /* we are using an actual index */
-    {
+    } else {
+        /* we are using an actual index */
         if ((bdb_state->ixdta[ixnum]) && (return_dta == 1))
             havedta = 1;
-
-        if (return_dta)
-            *reqdtalen = 0;
 
         ixlen_full = bdb_state->ixlen[ixnum];
         keycontainsgenid = bdb_keycontainsgenid(bdb_state, ixnum);
         ixrecnum = bdb_state->ixrecnum[ixnum];
         dbp = bdb_state->dbp_ix[ixnum];
     }
+
+    if (return_dta)
+        *reqdtalen = 0;
 
     if (ixlen == -1)
         ixlen = ixlen_full;
@@ -738,6 +735,9 @@ static int bdb_fetch_int_ll(
             }
 
             dbp = bdb_state->dbp_data[0][dtafile];
+            if (args->for_write) {
+                 flags |= DB_RMW;
+            }
         }
 
         memcpy(tmp_key, ix, ixlen);
@@ -2260,11 +2260,14 @@ static int bdb_fetch_int(int return_dta, int direction, int lookahead,
         }
     }
 
-    rc = bdb_lock_table_read(bdb_state, tran);
+    if (!args->for_write) {
+        rc = bdb_lock_table_read(bdb_state, tran);
 
-    if (rc) {
-        logmsg(LOGMSG_ERROR, "bdb_fetch_int unable to get table read lock.\n");
-        return -1;
+        if (rc) {
+            logmsg(LOGMSG_ERROR,
+                   "bdb_fetch_int unable to get table read lock.\n");
+            return -1;
+        }
     }
 
     /* if its not rowlocks mode, just run old way */

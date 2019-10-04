@@ -46,6 +46,8 @@
 #include "genid.h"
 #include "logmsg.h"
 
+extern int gbl_debug_omit_dta_write;
+
 /* if dta is not null, it will be tailed after the genid in btree data part */
 static int bdb_prim_addkey_int(bdb_state_type *bdb_state, tran_type *tran,
                                void *ixdta, int ixnum, int rrn,
@@ -139,7 +141,7 @@ static int bdb_prim_addkey_int(bdb_state_type *bdb_state, tran_type *tran,
             assert(rec == (iptr + 2));
             keydata_len = sizeof(unsigned long long) + recsize;
         } else {
-            /* collattr or non-odh datacopy */
+            /* for decimal, collattr or non-odh datacopy */
             memcpy(iptr + 2, dta, dtalen);
         }
     }
@@ -256,6 +258,11 @@ static int bdb_prim_allocdta_int(bdb_state_type *bdb_state, tran_type *tran,
             set_participant_stripeid(bdb_state, participantstripid, *genid);
     }
 
+    if (gbl_debug_omit_dta_write) {
+        //needs to be done here intstead of glue.c because need genid to be created because it is used to insert blob and idx
+        return rrn;
+    }
+
     /* add data to the dta file, with key being rrn */
     memset(&dbt_key, 0, sizeof(dbt_key));
     memset(&dbt_data, 0, sizeof(dbt_data));
@@ -273,7 +280,7 @@ static int bdb_prim_allocdta_int(bdb_state_type *bdb_state, tran_type *tran,
     dbp = bdb_state->dbp_data[0][dtafile];
 
     rc = ll_dta_add(bdb_state, *genid, dbp, tran, 0, dtafile /* stripe! */,
-                    &dbt_key, &dbt_data, DB_NOOVERWRITE);
+                    &dbt_key, &dbt_data, DB_NOOVERWRITE, 0);
 
     if (genid_dta)
         free(genid_dta);
@@ -322,7 +329,8 @@ int bdb_prim_allocdta_genid(bdb_state_type *bdb_state, tran_type *tran,
 static int bdb_prim_adddta_n_genid_int(bdb_state_type *bdb_state,
                                        tran_type *tran, int dtanum,
                                        void *dtaptr, size_t dtalen, int rrn,
-                                       unsigned long long genid, int *bdberr)
+                                       unsigned long long genid, int *bdberr,
+                                       int odhready)
 {
     DBT dbt_key, dbt_data;
     unsigned long long *genid_dta = NULL;
@@ -387,7 +395,7 @@ static int bdb_prim_adddta_n_genid_int(bdb_state_type *bdb_state,
     dbp = get_dbp_from_genid(bdb_state, dtanum, genid, &stripe);
 
     rc = ll_dta_add(bdb_state, genid, dbp, tran, dtanum, stripe, &dbt_key,
-                    &dbt_data, DB_NOOVERWRITE);
+                    &dbt_data, DB_NOOVERWRITE, odhready);
 
     if (genid_dta)
         free(genid_dta);
@@ -412,12 +420,9 @@ static int bdb_prim_adddta_n_genid_int(bdb_state_type *bdb_state,
 
 int bdb_prim_adddta_n_genid(bdb_state_type *bdb_state, tran_type *tran,
                             int dtanum, void *dtaptr, size_t dtalen, int rrn,
-                            unsigned long long genid, int *bdberr)
+                            unsigned long long genid, int *bdberr, int odhready)
 {
-    int rc;
 
-    rc = bdb_prim_adddta_n_genid_int(bdb_state, tran, dtanum, dtaptr, dtalen,
-                                     rrn, genid, bdberr);
-
-    return rc;
+    return bdb_prim_adddta_n_genid_int(bdb_state, tran, dtanum, dtaptr, dtalen,
+                                       rrn, genid, bdberr, odhready);
 }

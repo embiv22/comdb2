@@ -160,9 +160,25 @@ The parameters are as follows:
       
       The password of the database user. The default is empty.
 
-    * _comdb2_timeout_=Integer
+    * _sotimeout_=Integer
 
-      The server-side socket read and write timeouts in seconds. The default is 10 seconds.
+      Socket timeout for the target database, in milliseconds. The default is 5,000 milliseconds.
+
+    * _maxquerytime_=Integer
+
+      The maximum execution time allowed in seconds for a query.
+
+    * _connect_timeout_=Integer
+
+      Connect timeout in milliseconds. The default is 100 milliseconds.
+
+    * _comdb2db_timeout_=Integer
+
+      Socket timeout for comdb2db, in milliseconds. The default is 5,000 milliseconds.
+
+    * _dbinfo_timeout_=Integer
+
+      Socket timeout for the DBINFO response, in milliseconds. The default is 500 milliseconds.
 
     * _load_balance_="room" \| "randomroom" \| "random"
 

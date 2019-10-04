@@ -40,7 +40,6 @@
 #include <epochlib.h>
 #include "marshal.h"
 #include <segstr.h>
-#include <lockmacro.h>
 
 #include <list.h>
 
@@ -56,6 +55,7 @@
 #include <quantize.h>
 #include <sockpool.h>
 
+#include "lockmacros.h"
 #include "comdb2.h"
 #include "sql.h"
 
@@ -157,8 +157,6 @@ static void *watchdog_thread(void *arg)
     uint64_t master_lastlsnbytes = 0, master_curlsnbytes;
     int sockpool_timeout;
 
-    Pthread_mutex_init(&gbl_watchdog_kill_mutex, NULL);
-
     Pthread_attr_init(&gbl_pthread_joinable_attr);
     Pthread_attr_setstacksize(&gbl_pthread_joinable_attr, DEFAULT_THD_STACKSZ);
     pthread_attr_setdetachstate(&gbl_pthread_joinable_attr,
@@ -167,7 +165,8 @@ static void *watchdog_thread(void *arg)
     while (!gbl_ready)
         sleep(1);
 
-    while (!thedb->exiting) {
+    int test_io_time = 0;
+    while (!db_is_stopped()) {
         gbl_epoch_time = comdb2_time_epoch();
 
         if (!gbl_nowatch) {
@@ -318,8 +317,16 @@ static void *watchdog_thread(void *arg)
                to do. */
             bdb_flush_up_to_lsn(thedb->bdb_env, 1, 0);
 
-            if (bdb_watchdog_test_io(thedb->bdb_env))
-                its_bad = 1;
+            if (gbl_epoch_time - test_io_time >
+                bdb_attr_get(thedb->bdb_attr, BDB_ATTR_TEST_IO_TIME)) {
+                if (bdb_watchdog_test_io(thedb->bdb_env)) {
+                    logmsg(LOGMSG_FATAL,
+                           "%s:bdb_watchdog_test_io failed - aborting\n",
+                           __func__);
+                    abort();
+                }
+                test_io_time = gbl_epoch_time;
+            }
 
             /* if nothing was bad, update the timestamp */
             if (!its_bad && !its_bad_slow) {
@@ -411,9 +418,9 @@ static void *watchdog_watcher_thread(void *arg)
     extern int gbl_watchdog_watch_threshold;
     int failed_once = 0;
 
-    while (!thedb->exiting) {
+    while (!db_is_stopped()) {
         sleep(10);
-        if (gbl_nowatch || thedb->exiting)
+        if (gbl_nowatch || db_is_stopped())
             continue;
 
         int tmstmp = comdb2_time_epoch();

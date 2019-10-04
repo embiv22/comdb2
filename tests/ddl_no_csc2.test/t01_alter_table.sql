@@ -135,7 +135,7 @@ DROP TABLE t1;
 DROP TABLE t2;
 
 CREATE TABLE t1(i INT, j INT, k INT, UNIQUE idx1 (i,j,k), UNIQUE idx2(i DESC, j DESC, k DESC)) $$
-CREATE TABLE t2(i INT, j INT, k INT, FOREIGN KEY (i,j) REFERENCES t1(i,j), FOREIGN KEY (i DESC, j DESC) REFERENCES t1(i DESC, j DESC)) $$
+CREATE TABLE t2(i INT, j INT, k INT, FOREIGN KEY (i,j) REFERENCES t1(i,j)) $$
 SELECT * FROM sqlite_master;
 SELECT * FROM comdb2_constraints WHERE tablename NOT LIKE 'sqlite_stat%';
 ALTER TABLE t2 DROP FOREIGN KEY '$CONSTRAINT_9C9BDEA4' $$
@@ -148,7 +148,7 @@ DROP TABLE t2;
 DROP TABLE t1;
 
 CREATE TABLE t1(i INT, j INT, k INT, UNIQUE idx1 (i,j,k), UNIQUE idx2(i DESC, j DESC, k DESC)) $$
-CREATE TABLE t2(i INT, j INT, k INT, CONSTRAINT "mycons1" FOREIGN KEY (i,j) REFERENCES t1(i,j), FOREIGN KEY (i DESC, j DESC) REFERENCES t1(i DESC, j DESC)) $$
+CREATE TABLE t2(i INT, j INT, k INT, CONSTRAINT "mycons1" FOREIGN KEY (i,j) REFERENCES t1(i,j), FOREIGN KEY (i, j) REFERENCES t1(i, j)) $$
 SELECT * FROM comdb2_constraints WHERE tablename NOT LIKE 'sqlite_stat%';
 ALTER TABLE t2 ADD CONSTRAINT "mycons2" FOREIGN KEY (i) REFERENCES t1(i) $$
 SELECT * FROM comdb2_constraints WHERE tablename NOT LIKE 'sqlite_stat%';
@@ -294,4 +294,13 @@ CREATE TABLE t2(i INT INDEX)$$
 ALTER TABLE t2 DROP INDEX '$KEY_A44A20B', ADD FOREIGN KEY (i) REFERENCES t1(i)$$
 SELECT csc2 FROM sqlite_master WHERE name LIKE 't2';
 DROP TABLE t2;
+DROP TABLE t1;
+
+# A test that plays with index on expressions and quotes.
+CREATE TABLE t1(json vutf8(128), UNIQUE (CAST(json_extract(json, '$.a') AS int)), UNIQUE (CAST(json_extract(json, '$.b') AS cstring(10))))$$
+ALTER TABLE t1 ADD COLUMN v CSTRING(10)$$
+ALTER TABLE t1 ADD UNIQUE INDEX idx1 (CAST(v || 'aaa' AS CSTRING(10)))$$
+CREATE INDEX idx2 ON t1(CAST(v || 'aaa' AS CSTRING(10)));
+CREATE INDEX idx3 ON t1(CAST(v || '"aaa"' AS CSTRING(10)));
+SELECT csc2 FROM sqlite_master WHERE name LIKE 't1';
 DROP TABLE t1;

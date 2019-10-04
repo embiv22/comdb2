@@ -43,6 +43,7 @@
 #include "decDouble.h"
 #include "decQuad.h"
 #include "decimal.h"
+#include "blob_buffer.h"
 
 #define DB_MAX_TZNAMEDB CDB2_MAX_TZNAME
 #define DTTZ_PREC_MSEC 3
@@ -115,25 +116,6 @@ typedef struct {
     unsigned int prec;
     char tzname[CDB2_MAX_TZNAME];
 } datetime_t;
-
-/* Used for collecting blob data before a keyless add/upd/del.
- * An array of these also supplements */
-typedef struct blob_buffer {
-    int exists; /* to differentiate 0 length from null */
-    char *data;
-    size_t length;
-
-    /* collected has a double life.  on the user side, it is used to
-     * track how much blob we've collected from the transaction data.
-     * on the server side, it should be non-zero even for a null blob
-     * so we know that it's been through the type system (helps us tell
-     * which blobs to update on updates) */
-    size_t collected;
-
-    /* This is used by javasp.c to keep track of our reference to the byte
-     * array object that this blob came from. */
-    void *javasp_bytearray;
-} blob_buffer_t;
 
 /* Options used to control conversion from/to this field. */
 #ifndef _TYPES_INTERNAL_H_
@@ -2055,10 +2037,10 @@ short decimal_quantum_get(char *pdec, int len, int *sign);
 void decimal_quantum_set(char *pdec, int len, short *quantum, int *sign);
 struct dbtable;
 struct schema;
-int extract_decimal_quantum(struct dbtable *db, int ix, char *inbuf, char *outbuf,
-                            int outbuf_max, int *outlen);
-short field_decimal_quantum(struct dbtable *db, struct schema *s, int fnum, 
-                            char *tail, int taillen, int *sign);
+int extract_decimal_quantum(const struct dbtable *db, int ix, char *inbuf,
+                            char *outbuf, int outbuf_max, int *outlen);
+short field_decimal_quantum(const struct dbtable *db, struct schema *s,
+                            int fnum, char *tail, int taillen, int *sign);
 
 /* don't want duplicate code between sql and lua */
 int dttz_cmp(const dttz_t *, const dttz_t *);
@@ -2092,4 +2074,9 @@ int get_type(struct param_data *out, void *in, int inlen, int intype,
              const char *tzname, int little);
 
 int intv_to_str(const intv_t *, char *, int, int *);
+
+int odhfy_blob_buffer(const struct dbtable *db, blob_buffer_t *blob,
+                      int blobind);
+int unodhfy_blob_buffer(const struct dbtable *db, blob_buffer_t *blob,
+                        int blobind);
 #endif

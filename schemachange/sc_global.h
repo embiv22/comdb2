@@ -47,7 +47,7 @@ extern int gbl_sc_last_writer_time;
 extern pthread_mutex_t gbl_sc_lock;
 extern int gbl_sc_report_freq;      /* seconds between reports */
 extern int gbl_sc_abort;
-extern int gbl_sc_resume_start;
+extern uint32_t gbl_sc_resume_start;
 /* see sc_del_unused_files() and sc_del_unused_files_check_progress() */
 extern int sc_del_unused_files_start_ms;
 extern int gbl_sc_del_unused_files_threshold_ms;
@@ -79,5 +79,11 @@ int replicant_reload_analyze_stats();
 void sc_set_logical_redo_lwm(char *table, unsigned int file);
 unsigned int sc_get_logical_redo_lwm();
 unsigned int sc_get_logical_redo_lwm_table(char *table);
+
+void add_ongoing_alter(struct schema_change_type *sc);
+void remove_ongoing_alter(struct schema_change_type *sc);
+struct schema_change_type *find_ongoing_alter(char *table);
+struct schema_change_type *preempt_ongoing_alter(char *table, int action);
+void clear_ongoing_alter();
 
 #endif

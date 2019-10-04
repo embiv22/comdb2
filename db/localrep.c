@@ -22,6 +22,7 @@
 #include "localrep.h"
 #include "endian_core.h"
 #include <flibc.h>
+#include "str0.h"
 
 typedef struct {
     char name[32];    /* name of field as a \0 terminated string */
@@ -113,6 +114,10 @@ int local_replicant_log_add(struct ireq *iq, void *trans, void *od_dta,
         if (fld->blob_index == -1)
             sz += fld->len;
         else {
+            rc = unodhfy_blob_buffer(iq->usedb, blobs + fld->blob_index,
+                                     fld->blob_index);
+            if (rc != 0)
+                goto err;
             /* vutf8 and fits in inline portion */
             if (fld->type == CLIENT_VUTF8 &&
                 blobs[fld->blob_index].exists == 0) {
@@ -398,9 +403,6 @@ int local_replicant_log_add_for_update(struct ireq *iq, void *trans, int rrn,
     /* NOTE: 80% of this routine is a copy-and-paste job from
      * local_replicant_log_add.
      * One day, when there's nothing better to do, fix that. */
-
-    if (!iq->usedb->do_local_replication)
-        return 0;
 
     if (!iq->usedb->do_local_replication)
         return 0;
@@ -792,7 +794,7 @@ int local_replicant_write_clear(struct ireq *in_iq, void *in_trans,
         return 0;
     }
 
-    strncpy(table, db->tablename, sizeof(table));
+    strncpy0(table, db->tablename, sizeof(table));
 
     table[31] = 0;
 

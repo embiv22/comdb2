@@ -161,8 +161,8 @@ static int systblTblSizeFilter(
   int argc, sqlite3_value **argv
 ){
   systbl_tblsize_cursor *pCur = (systbl_tblsize_cursor*)pVtabCursor;
-
   pCur->iRowid = 0;
+  comdb2_next_allowed_table(&pCur->iRowid);
   return SQLITE_OK;
 }
 
@@ -202,6 +202,7 @@ const sqlite3_module systblTblSizeModule = {
   0,                       /* xRelease */
   0,                       /* xRollbackTo */
   0,                       /* xShadowName */
+  .access_flag = CDB2_ALLOW_ALL,
 };
 
 #endif /* (!defined(SQLITE_CORE) || defined(SQLITE_BUILDING_FOR_COMDB2)) \
