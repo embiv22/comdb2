@@ -674,7 +674,6 @@ DEF_ATTR(
     "Print a message to stdout instead of performing auto-analyze ourselves")
 DEF_ATTR(TEST_IO_TIME, test_io_time, SECS, 10,
          "Check I/O in watchdog this often")
-
 /*
   BDB_ATTR_REPTIMEOUT
      amount of time to wait for acks.  when the time is exceeded,

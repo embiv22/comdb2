@@ -416,7 +416,6 @@ void *auto_analyze_main(void *unused)
                        "run time %s\n",
                        tbl->tablename, tbl->aa_saved_counter, delta,
                        ctime_r(&tbl->aa_lastepoch, my_buf));
-
                 logmsg(LOGMSG_USER,
                        "AUTOANALYZE: Requesting analyze "
                        "be run for table: %s\n",
