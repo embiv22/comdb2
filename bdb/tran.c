@@ -1608,9 +1608,9 @@ int bdb_tran_commit_with_seqnum_int(bdb_state_type *bdb_state, tran_type *tran,
             if (iirc) {
                 tran->tid->abort(tran->tid);
                 bdb_osql_trn_repo_unlock();
-                logmsg(LOGMSG_ERROR, 
-                        "%s:%d failed to log logical commit, rc %d\n", __func__,
-                       __LINE__, iirc);
+                logmsg(LOGMSG_ERROR,
+                       "%s:%d td %ld failed to log logical commit, rc %d\n",
+                       __func__, __LINE__, pthread_self(), iirc);
                 *bdberr = BDBERR_MISC;
                 outrc = -1;
                 goto cleanup;
@@ -2520,6 +2520,11 @@ int bdb_curtran_has_waiters(bdb_state_type *bdb_state, cursor_tran_t *curtran)
                                                  curtran->lockerid);
 }
 
+unsigned int bdb_curtran_get_lockerid(cursor_tran_t *curtran)
+{
+    return curtran->lockerid;
+}
+
 int bdb_free_curtran_locks(bdb_state_type *bdb_state, cursor_tran_t *curtran,
                            int *bdberr)
 {
@@ -2659,7 +2664,7 @@ int bdb_get_lsn_lwm(bdb_state_type *bdb_state, DB_LSN *lsnout)
     return rc;
 }
 
-int bdb_get_lid_from_cursortran(cursor_tran_t *curtran)
+uint32_t bdb_get_lid_from_cursortran(cursor_tran_t *curtran)
 {
     return curtran->lockerid;
 }

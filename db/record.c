@@ -52,7 +52,6 @@
 
 extern int gbl_partial_indexes;
 extern int gbl_expressions_indexes;
-extern int gbl_reorder_idx_writes;
 
 static int check_blob_buffers(struct ireq *iq, blob_buffer_t *blobs,
                               size_t maxblobs, const char *tblname,
@@ -210,7 +209,7 @@ int add_record(struct ireq *iq, void *trans, const uint8_t *p_buf_tag_name,
 
     if (!is_event_from_sc(flags) && !(flags & RECFLAGS_DONT_LOCK_TBL)) {
         // dont lock table if adding from SC or if RECFLAGS_DONT_LOCK_TBL
-        assert(!iq->is_sorese); // sorese codepaths will have locked it already
+        assert(!iq->sorese); // sorese codepaths will have locked it already
 
         reqprintf(iq, "Calling bdb_lock_table_read()");
         rc = bdb_lock_table_read(iq->usedb->handle, trans);
@@ -378,6 +377,25 @@ int add_record(struct ireq *iq, void *trans, const uint8_t *p_buf_tag_name,
         ondisktagsc = find_tag_schema(iq->usedb->tablename, ondisktag);
     }
 
+    rc = set_master_columns(iq, trans, od_dta, od_len);
+    if (rc == BDBERR_DEADLOCK) {
+        if (iq->debug)
+            reqprintf(iq, "SET MASTER COLUMNS DEADLOCK");
+        retrc = RC_INTERNAL_RETRY;
+        ERR;
+    } else if (rc == BDBERR_MAX_SEQUENCE) {
+        reqerrstr(iq, ERR_INTERNAL, "Exhausted column sequence");
+        *opfailcode = ERR_INTERNAL;
+        retrc = ERR_INTERNAL;
+        ERR;
+    } else if (rc) {
+        if (iq->debug)
+            reqprintf(iq, "SET MASTER COLUMNS ERROR %d", rc);
+        *opfailcode = ERR_INTERNAL;
+        retrc = ERR_INTERNAL;
+        ERR;
+    }
+
     rc = verify_check_constraints(iq->usedb, od_dta, blobs, maxblobs, 1);
     if (rc < 0) {
         reqerrstr(iq, ERR_INTERNAL, "Internal error during CHECK constraint");
@@ -483,9 +501,8 @@ int add_record(struct ireq *iq, void *trans, const uint8_t *p_buf_tag_name,
 
     if (iq->usedb->nix > 0) {
         bool reorder =
-            gbl_reorder_idx_writes && !is_event_from_sc(flags) &&
-            rec_flags == 0 && (flags & RECFLAGS_DONT_REORDER_IDX) == 0 &&
-            iq->usedb->sc_from != iq->usedb &&
+            osql_is_index_reorder_on(iq->osql_flags) && !is_event_from_sc(flags) &&
+            rec_flags == 0 && iq->usedb->sc_from != iq->usedb &&
             strcasecmp(iq->usedb->tablename, "comdb2_oplog") != 0 &&
             strcasecmp(iq->usedb->tablename, "comdb2_commit_log") != 0 &&
             strncasecmp(iq->usedb->tablename, "sqlite_stat", 11) != 0;
@@ -502,7 +519,7 @@ int add_record(struct ireq *iq, void *trans, const uint8_t *p_buf_tag_name,
          * temporary table to enable cascading updates, if needed.
          */
 
-        if (has_constraint(flags)) { /* if NOT no constraints */
+        if (has_constraint(flags)) {
             if (!is_event_from_sc(flags)) {
                 /* enqueue the add of the key for constraint checking purpose */
                 rc = insert_add_op(iq, opcode, *rrn, -1, *genid, ins_keys,
@@ -683,7 +700,7 @@ int upd_record(struct ireq *iq, void *trans, void *primkey, int rrn,
     int prefixes = 0;
     int conv_flags = 0;
     int expected_dat_len;
-    blob_status_t oldblobs[MAXBLOBS] = {{0}};
+    blob_status_t oldblobs = {0};
     struct schema *dynschema = NULL;
     char *allocced_memory = NULL;
     size_t mallocced_bytes;
@@ -766,7 +783,7 @@ int upd_record(struct ireq *iq, void *trans, void *primkey, int rrn,
     }
 
     if (!(flags & RECFLAGS_DONT_LOCK_TBL)) {
-        assert(!iq->is_sorese); // sorese codepaths will have locked it already
+        assert(!iq->sorese); // sorese codepaths will have locked it already
 
         reqprintf(iq, "Calling bdb_lock_table_read()");
         rc = bdb_lock_table_read(iq->usedb->handle, trans);
@@ -1035,7 +1052,7 @@ int upd_record(struct ireq *iq, void *trans, void *primkey, int rrn,
     if (!(flags & RECFLAGS_NO_TRIGGERS) &&
         javasp_trans_care_about(iq->jsph, JAVASP_TRANS_LISTEN_SAVE_BLOBS_UPD)) {
         rc = save_old_blobs(iq, trans, ".ONDISK", old_dta, rrn, vgenid,
-                            oldblobs);
+                            &oldblobs);
         if (rc != 0) {
             *opfailcode = OP_FAILED_INTERNAL + ERR_SAVE_BLOBS;
             if (rc == RC_INTERNAL_RETRY)
@@ -1109,7 +1126,7 @@ int upd_record(struct ireq *iq, void *trans, void *primkey, int rrn,
         (iq->usedb->sc_from == iq->usedb && iq->usedb->sc_to->ix_blob)) {
         if (!got_oldblobs) {
             rc = save_old_blobs(iq, trans, ".ONDISK", old_dta, rrn, vgenid,
-                                oldblobs);
+                                &oldblobs);
             if (rc != 0) {
                 if (rc == RC_INTERNAL_RETRY)
                     retrc = rc;
@@ -1117,8 +1134,8 @@ int upd_record(struct ireq *iq, void *trans, void *primkey, int rrn,
                     retrc = ERR_INTERNAL;
                 goto err;
             }
-            blob_status_to_blob_buffer(oldblobs, del_blobs_buf);
-            blob_status_to_blob_buffer(oldblobs, add_blobs_buf);
+            blob_status_to_blob_buffer(&oldblobs, del_blobs_buf);
+            blob_status_to_blob_buffer(&oldblobs, add_blobs_buf);
         }
         for (blobno = 0;
              blobno < maxblobs && blobno < iq->usedb->schema->numblobs;
@@ -1157,6 +1174,19 @@ int upd_record(struct ireq *iq, void *trans, void *primkey, int rrn,
         }
         del_idx_blobs = del_blobs_buf;
         add_idx_blobs = add_blobs_buf;
+    }
+    rc = upd_master_columns(iq, trans, od_dta, od_len);
+    if (rc == BDBERR_DEADLOCK) {
+        if (iq->debug)
+            reqprintf(iq, "UPD MASTER COLUMNS DEADLOCK");
+        retrc = RC_INTERNAL_RETRY;
+        ERR;
+    } else if (rc) {
+        if (iq->debug)
+            reqprintf(iq, "SET MASTER COLUMNS ERROR %d", rc);
+        *opfailcode = ERR_INTERNAL;
+        retrc = ERR_INTERNAL;
+        ERR;
     }
 
     rc = verify_check_constraints(iq->usedb, od_dta, blobs, maxblobs, 0);
@@ -1433,11 +1463,11 @@ int upd_record(struct ireq *iq, void *trans, void *primkey, int rrn,
         javasp_trans_care_about(iq->jsph, JAVASP_TRANS_LISTEN_AFTER_UPD)) {
         struct javasp_rec *joldrec;
         struct javasp_rec *jnewrec;
-        blob_status_t new_rec_blobs[MAXBLOBS] = {{0}};
+        blob_status_t new_rec_blobs = {0};
 
         /* old record no longer exists - don't set trans or rrn */
         joldrec = javasp_alloc_rec(old_dta, od_len, iq->usedb->tablename);
-        javasp_rec_set_blobs(joldrec, oldblobs);
+        javasp_rec_set_blobs(joldrec, &oldblobs);
         javasp_rec_set_trans(joldrec, iq->jsph, rrn, vgenid);
 
         /* new record now exists on disk */
@@ -1447,15 +1477,15 @@ int upd_record(struct ireq *iq, void *trans, void *primkey, int rrn,
            specified in the 'blobs' variable (eg: static tag that omits a blob)
            */
         save_old_blobs(iq, trans, ".ONDISK", od_dta, rrn, *genid,
-                       new_rec_blobs);
-        javasp_rec_set_blobs(jnewrec, new_rec_blobs);
+                       &new_rec_blobs);
+        javasp_rec_set_blobs(jnewrec, &new_rec_blobs);
         javasp_rec_set_trans(jnewrec, iq->jsph, rrn, vgenid);
         rc =
             javasp_trans_tagged_trigger(iq->jsph, JAVASP_TRANS_LISTEN_AFTER_UPD,
                                         joldrec, jnewrec, iq->usedb->tablename);
         javasp_dealloc_rec(joldrec);
         javasp_dealloc_rec(jnewrec);
-        free_blob_status_data(new_rec_blobs);
+        free_blob_status_data(&new_rec_blobs);
         if (iq->debug)
             reqprintf(iq, "JAVASP_TRANS_LISTEN_AFTER_UPD %d", rc);
         if (rc != 0) {
@@ -1497,7 +1527,7 @@ int upd_record(struct ireq *iq, void *trans, void *primkey, int rrn,
     }
 
 err:
-    free_blob_status_data(oldblobs);
+    free_blob_status_data(&oldblobs);
     if (iq->debug)
         reqpopprefixes(iq, prefixes);
     if (dynschema)
@@ -1523,7 +1553,7 @@ int del_record(struct ireq *iq, void *trans, void *primkey, int rrn,
     int retrc = 0;
     int prefixes = 0;
     void *allocced_memory = NULL;
-    blob_status_t oldblobs[MAXBLOBS] = {{0}};
+    blob_status_t oldblobs = {0};
     void *od_dta;
     size_t od_len;
     int od_len_int;
@@ -1593,7 +1623,7 @@ int del_record(struct ireq *iq, void *trans, void *primkey, int rrn,
     }
 
     if (!(flags & RECFLAGS_DONT_LOCK_TBL)) {
-        assert(!iq->is_sorese); // sorese codepaths will have locked it already
+        assert(!iq->sorese); // sorese codepaths will have locked it already
 
         reqprintf(iq, "Calling bdb_lock_table_read()");
         rc = bdb_lock_table_read(iq->usedb->handle, trans);
@@ -1656,7 +1686,7 @@ int del_record(struct ireq *iq, void *trans, void *primkey, int rrn,
         (iq->usedb->sc_from == iq->usedb && iq->usedb->sc_to->ix_blob)) {
         if (!got_oldblobs) {
             rc = save_old_blobs(iq, trans, ".ONDISK", od_dta, rrn, genid,
-                                oldblobs);
+                                &oldblobs);
             if (rc != 0) {
                 if (rc == RC_INTERNAL_RETRY)
                     retrc = rc;
@@ -1664,7 +1694,7 @@ int del_record(struct ireq *iq, void *trans, void *primkey, int rrn,
                     retrc = ERR_INTERNAL;
                 goto err;
             }
-            blob_status_to_blob_buffer(oldblobs, blobs_buf);
+            blob_status_to_blob_buffer(&oldblobs, blobs_buf);
             got_oldblobs = 1;
         }
         if (gbl_partial_indexes && iq->usedb->ix_partial && del_keys == -1ULL) {
@@ -1710,7 +1740,7 @@ int del_record(struct ireq *iq, void *trans, void *primkey, int rrn,
      */
     if (!got_oldblobs && ((!(flags & RECFLAGS_NO_TRIGGERS) &&
         javasp_trans_care_about(iq->jsph, JAVASP_TRANS_LISTEN_SAVE_BLOBS_DEL)))) {
-        rc = save_old_blobs(iq, trans, ".ONDISK", od_dta, rrn, genid, oldblobs);
+        rc = save_old_blobs(iq, trans, ".ONDISK", od_dta, rrn, genid, &oldblobs);
         if (rc != 0) {
             *opfailcode = OP_FAILED_INTERNAL + ERR_SAVE_BLOBS;
             if (rc == RC_INTERNAL_RETRY)
@@ -1748,7 +1778,7 @@ int del_record(struct ireq *iq, void *trans, void *primkey, int rrn,
         struct javasp_rec *jrec;
         jrec = javasp_alloc_rec(od_dta, od_len, iq->usedb->tablename);
         javasp_rec_set_trans(jrec, iq->jsph, rrn, genid);
-        javasp_rec_set_blobs(jrec, oldblobs);
+        javasp_rec_set_blobs(jrec, &oldblobs);
         rc =
             javasp_trans_tagged_trigger(iq->jsph, JAVASP_TRANS_LISTEN_AFTER_DEL,
                                         jrec, NULL, iq->usedb->tablename);
@@ -1777,7 +1807,7 @@ err:
     if (!retrc && iq->__limits.maxcost && iq->cost > iq->__limits.maxcost)
         retrc = ERR_LIMIT;
 
-    free_blob_status_data(oldblobs);
+    free_blob_status_data(&oldblobs);
     if (iq->debug)
         reqpopprefixes(iq, prefixes);
     return retrc;
@@ -2766,7 +2796,7 @@ void testrep(int niter, int recsz)
             logmsg(LOGMSG_ERROR, "bdb_add_rep_blob rc %d bdberr %d\n", rc, bdberr);
             goto done;
         }
-        rc = trans_commit(&iq, tran, gbl_mynode);
+        rc = trans_commit(&iq, tran, gbl_myhostname);
         if (rc) {
             logmsg(LOGMSG_ERROR, "commit rc %d\n", rc);
             goto done;
